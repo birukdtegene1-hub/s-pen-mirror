@@ -1,0 +1,5 @@
+android/build/
+android/local-signing/
+__pycache__/
+*.pyc
+.publish/

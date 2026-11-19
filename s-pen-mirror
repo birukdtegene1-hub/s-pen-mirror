@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+import argparse
+import ipaddress
+import shutil
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Pair an Android phone and open its live S-Pen Mirror window.")
+    parser.add_argument("--host", type=ipaddress.IPv4Address, help="PC LAN IPv4 address to listen on and show in the QR")
+    parser.add_argument("--port", type=int, default=47831, help="TCP port on the PC (default 47831)")
+    args = parser.parse_args()
+    if not 1 <= args.port <= 65535:
+        parser.error("choose a port from 1 to 65535")
+    if args.host and (args.host.is_unspecified or args.host.is_multicast or args.host.is_reserved):
+        parser.error("choose a specific local interface address")
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from desktop.receiver import LiveView, Receiver, lan_address
+        from desktop.window import MirrorWindow
+        from PySide6.QtWidgets import QApplication
+    except ImportError as error:
+        parser.exit(1, f"Desktop dependency missing ({error}). On Garuda install pyside6 with pacman.\n")
+    for binary in ("openssl", "qrencode"):
+        if not shutil.which(binary):
+            parser.exit(1, f"Install {binary} with pacman and run the command again.\n")
+    try:
+        address = str(args.host) if args.host else lan_address()
+        view = LiveView()
+        receiver = Receiver(address, args.port, view)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        parser.exit(1, f"Could not start S-Pen Mirror. {error}\n")
+    app = QApplication([sys.argv[0]])
+    app.setApplicationName("S-Pen Mirror")
+    app.setDesktopFileName("s-pen-mirror")
+    signal.signal(signal.SIGINT, lambda *_: app.quit())
+    signal.signal(signal.SIGTERM, lambda *_: app.quit())
+    try:
+        window = MirrorWindow(receiver, view)
+        receiver.start()
+        print(f"S-Pen Mirror is listening on {address}:{receiver.port}. Scan the window from Pair PC on your phone.", flush=True)
+        window.show()
+        return app.exec()
+    finally:
+        receiver.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
