@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Add the S-Pen Mirror control to the Garuda Notch 2.2 action strip."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+from desktop.install_config import backup_config, replace_config
+
+
+def update_qml(path, edits):
+    original = path.read_text(encoding="utf-8")
+    updated = original
+    for before, after in edits:
+        if after in updated:
+            continue
+        if updated.count(before) != 1:
+            raise ValueError(f"{path.name} does not match the Garuda Notch 2.2 layout.")
+        updated = updated.replace(before, after, 1)
+    return path, original, updated
+
+
+def install(config, components):
+    source = json.dumps((components / "NotchToggle.qml").as_uri())
+    controller = json.dumps(str(components / "waybar-toggle"))
+    bar = update_qml((config / "Bar.qml").resolve(strict=True), [
+        ('"screen", "awake", "lid"]', '"screen", "awake", "lid", "spen-mirror"]'),
+        ('lid: "Lid awake" })', 'lid: "Lid awake", "spen-mirror": "S-Pen Mirror" })'),
+        ('    lidError: lidBlocker.error,', '''    lidError: lidBlocker.error,
+    spenMirror: spenMirrorControl.item ? {
+      state: spenMirrorControl.item.receiverState,
+      pending: spenMirrorControl.item.pending,
+      tooltip: spenMirrorControl.item.tooltip
+    } : ({}),'''),
+        ('  function toggleMode(mode) {', f'''  Loader {{
+    id: spenMirrorControl
+    Component.onCompleted: setSource({source}, {{ controller: {controller} }})
+  }}
+
+  function toggleMode(mode) {{'''),
+        ('  function openControl(control) {', '''  function openControl(control) {
+    if (control === "spen-mirror") {
+      if (spenMirrorControl.item) spenMirrorControl.item.toggle()
+      return
+    }'''),
+    ])
+    widget = update_qml((config / "WidgetHost.qml").resolve(strict=True), [
+        ('    "lid": "lid"', '    "lid": "lid",\n    "spen-mirror": "spen-mirror"'),
+        ('  readonly property bool toggled:', '  readonly property var spen: st.spenMirror || ({})\n  readonly property bool toggled:'),
+        ('    || (widgetId === "lid" && st.lidAwake === true)', '''    || (widgetId === "lid" && st.lidAwake === true)
+    || (widgetId === "spen-mirror" && spen.state === "on")'''),
+        ('readonly property color toggleColor: widgetId === "awake"',
+         'readonly property color toggleColor: widgetId === "spen-mirror" ? Theme.green : widgetId === "awake"'),
+        ('    : ({ network: "Network",', '''    : widgetId === "spen-mirror" ? (spen.tooltip || "S-Pen Mirror · Checking status…")
+    : ({ network: "Network",'''),
+        ('    AgentMark {', '''    Text {
+      visible: root.icon === "spen-mirror"
+      anchors.centerIn: parent
+      text: String.fromCodePoint(0xF040)
+      textFormat: Text.PlainText
+      color: root.spen.pending ? Theme.yellow : root.toggled ? Theme.green
+        : root.spen.state === "unavailable" ? Theme.red : Theme.text
+      font.family: P.glyphs
+      font.pixelSize: 16
+    }
+    AgentMark {'''),
+    ])
+    changes = [change for change in (widget, bar) if change[1] != change[2]]
+    backups = [backup_config(path) for path, _, _ in changes]
+    applied = []
+    try:
+        for path, original, updated in changes:
+            replace_config(path, updated)
+            applied.append((path, original))
+    except OSError:
+        for path, original in reversed(applied):
+            replace_config(path, original)
+        raise
+    return backups
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config-dir", type=Path, help="Directory containing Garuda Notch's QML files")
+    args = parser.parse_args()
+    home_config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    shell = os.environ.get("GARUDA_NOTCH_CONFIG")
+    config = args.config_dir or (Path(shell).parent if shell else home_config / "garuda-notch")
+    try:
+        backups = install(config, Path(__file__).resolve().parent / "desktop")
+    except (OSError, ValueError) as error:
+        parser.exit(1, f"Could not install the Notch toggle. {error}\n")
+    if backups:
+        print(f"Added S-Pen Mirror to the expanded Garuda Notch in {config}.")
+        print("Saved original files as " + ", ".join(str(path) for path in backups) + ".")
+    else:
+        print(f"S-Pen Mirror is already in the Garuda Notch in {config}.")
+
+
+if __name__ == "__main__":
+    main()

@@ -14,12 +14,14 @@ final class Endpoint {
         this.pin = pin;
     }
 
+    Endpoint withToken(String token) { return new Endpoint(host, port, token, pin); }
+
     static Endpoint parse(String link) {
         try {
             URI uri = new URI(link.trim());
             String[] parts = uri.getRawPath().split("/", -1);
             if (!"spenmirror".equals(uri.getScheme()) || uri.getHost() == null
-                    || !uri.getHost().matches("[0-9]+(\\.[0-9]+){3}")
+                    || !validHost(uri.getHost())
                     || uri.getPort() < 1 || uri.getPort() > 65535 || uri.getUserInfo() != null
                     || uri.getRawQuery() != null || uri.getRawFragment() != null
                     || parts.length != 4 || !parts[1].equals("v1")
@@ -34,5 +36,16 @@ final class Endpoint {
         } catch (Exception e) {
             throw new IllegalArgumentException("Scan or paste the pairing link from the PC window.");
         }
+    }
+
+    private static boolean validHost(String host) {
+        if (!host.matches("[0-9]{1,3}(\\.[0-9]{1,3}){3}")) return false;
+        String[] parts = host.split("\\.");
+        int first = Integer.parseInt(parts[0]);
+        if (first == 0 || first == 127 || first >= 224) return false;
+        for (String part : parts) {
+            if (Integer.parseInt(part) > 255 || (part.length() > 1 && part.charAt(0) == '0')) return false;
+        }
+        return true;
     }
 }

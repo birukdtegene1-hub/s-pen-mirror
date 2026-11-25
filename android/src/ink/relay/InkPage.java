@@ -20,6 +20,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.ArrayDeque;
 import java.util.Arrays;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -55,11 +56,15 @@ final class InkPage {
 
     InkPage(Context context, int viewWidth, int viewHeight) {
         settings = context.getSharedPreferences("ink-tools", Context.MODE_PRIVATE);
-        tool = Tool.valueOf(settings.getString("tool", "PEN"));
-        color = settings.getInt("color", COLORS[0]);
-        size = settings.getInt("size", 6);
-        paper = settings.getInt("paper", 0);
-        fingers = settings.getBoolean("fingers", false);
+        Map<String, ?> saved = settings.getAll();
+        tool = Tool.PEN;
+        for (Tool option : Tool.values()) {
+            if (option != Tool.CLEAR && option.name().equals(saved.get("tool"))) tool = option;
+        }
+        color = intPreference(saved.get("color"), COLORS[0], Integer.MIN_VALUE, Integer.MAX_VALUE);
+        size = intPreference(saved.get("size"), 6, 1, 36);
+        paper = intPreference(saved.get("paper"), 0, 0, PAPERS.length - 1);
+        fingers = Boolean.TRUE.equals(saved.get("fingers"));
         file = new AtomicFile(new File(context.getFilesDir(), "last-ink.png"));
         try (FileInputStream input = file.openRead()) {
             base = BitmapFactory.decodeStream(input);
@@ -78,6 +83,12 @@ final class InkPage {
         translucent.setAlpha(92);
         rule.setColor(0xffdce3de);
         rule.setStrokeWidth(1.4f);
+    }
+
+    private static int intPreference(Object value, int fallback, int minimum, int maximum) {
+        if (!(value instanceof Integer)) return fallback;
+        int number = (Integer) value;
+        return number >= minimum && number <= maximum ? number : fallback;
     }
 
     static Bitmap bitmap(int w, int h) {
@@ -118,7 +129,8 @@ final class InkPage {
         int i = s.length;
         x = Math.max(0, Math.min(width - 1, x));
         y = Math.max(0, Math.min(height - 1, y));
-        if (i >= 3 && s.data[i - 3] == x && s.data[i - 2] == y) return;
+        if (i >= 3 && s.data[i - 3] == x && s.data[i - 2] == y
+                && (s.tool != Tool.PEN || s.data[i - 1] == pressure)) return;
         s.add(x, y, pressure);
         float w = segment(inkCanvas, s, i);
         float lastX = i > 0 ? s.data[i - 3] : x, lastY = i > 0 ? s.data[i - 2] : y;
@@ -131,7 +143,8 @@ final class InkPage {
 
     private float segment(Canvas target, Stroke s, int i) {
         float x = s.data[i], y = s.data[i + 1], p = s.data[i + 2];
-        if (i > 0) p = (p + s.data[i - 1]) * 0.5f;
+        boolean stationary = i == 0 || (s.data[i - 3] == x && s.data[i - 2] == y);
+        if (!stationary) p = (p + s.data[i - 1]) * 0.5f;
         float w = s.size;
         if (s.tool == Tool.PEN) w *= 0.23f + 1.35f * Math.min(1, Math.max(0, p));
         if (s.tool == Tool.HIGHLIGHTER) { w *= 3; target = mask; }
@@ -139,7 +152,7 @@ final class InkPage {
         paint.setXfermode(s.tool == Tool.ERASER ? erase : null);
         paint.setColor(s.color);
         paint.setStrokeWidth(w);
-        if (i == 0) target.drawCircle(x, y, w / 2, paint);
+        if (stationary) target.drawCircle(x, y, w / 2, paint);
         else target.drawLine(s.data[i - 3], s.data[i - 2], x, y, paint);
         return w;
     }
@@ -281,7 +294,7 @@ final class InkPage {
         void rotate(int height) {
             for (int i = 0; i < length; i += 3) {
                 float x = data[i];
-                data[i] = height - data[i + 1];
+                data[i] = height - 1 - data[i + 1];
                 data[i + 1] = x;
             }
         }

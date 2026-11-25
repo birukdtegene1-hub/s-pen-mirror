@@ -24,6 +24,7 @@ import com.google.zxing.qrcode.QRCodeReader;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 
 @SuppressWarnings("deprecation")
 public final class ScanActivity extends Activity implements SurfaceHolder.Callback {
@@ -31,9 +32,12 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private SurfaceView preview;
+    private FrameLayout previewArea;
     private TextView hint;
     private SurfaceHolder surface;
     private Camera camera;
+    private Camera.Size previewSize;
+    private int previewRotation;
     private boolean resumed;
 
     @Override public void onCreate(Bundle state) {
@@ -42,7 +46,10 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
         root.setBackgroundColor(0xff16221b);
         preview = new SurfaceView(this);
         preview.getHolder().addCallback(this);
-        root.addView(preview);
+        previewArea = new FrameLayout(this);
+        previewArea.addView(preview, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
+        previewArea.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> fitPreview());
+        root.addView(previewArea);
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
         panel.setBackgroundColor(0xf5f3f5ef);
@@ -97,10 +104,13 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
             if (best != null) params.setPreviewSize(best.width, best.height);
             params.setPreviewFormat(ImageFormat.NV21);
             camera.setParameters(params);
+            previewSize = camera.getParameters().getPreviewSize();
             int rotation = getWindowManager().getDefaultDisplay().getRotation() * 90;
             int degrees = info.facing == Camera.CameraInfo.CAMERA_FACING_BACK
                     ? (info.orientation - rotation + 360) % 360 : (360 - (info.orientation + rotation) % 360) % 360;
             camera.setDisplayOrientation(degrees);
+            previewRotation = degrees;
+            fitPreview();
             camera.setPreviewDisplay(surface);
             camera.startPreview();
             next();
@@ -110,41 +120,73 @@ public final class ScanActivity extends Activity implements SurfaceHolder.Callba
         }
     }
 
+    private void fitPreview() {
+        if (previewSize == null || previewArea.getWidth() == 0 || previewArea.getHeight() == 0) return;
+        boolean rotated = previewRotation % 180 != 0;
+        int width = rotated ? previewSize.height : previewSize.width;
+        int height = rotated ? previewSize.width : previewSize.height;
+        float scale = Math.min((float) previewArea.getWidth() / width, (float) previewArea.getHeight() / height);
+        FrameLayout.LayoutParams bounds = (FrameLayout.LayoutParams) preview.getLayoutParams();
+        int fittedWidth = Math.max(1, Math.round(width * scale));
+        int fittedHeight = Math.max(1, Math.round(height * scale));
+        if (bounds.width != fittedWidth || bounds.height != fittedHeight) {
+            bounds.width = fittedWidth;
+            bounds.height = fittedHeight;
+            preview.setLayoutParams(bounds);
+        }
+    }
+
     private void next() {
-        if (camera == null || isFinishing()) return;
-        camera.setOneShotPreviewCallback((data, source) -> {
-            if (source != camera || data == null) return;
-            Camera.Size s = source.getParameters().getPreviewSize();
-            worker.execute(() -> {
-                String text = null;
-                try {
-                    PlanarYUVLuminanceSource pixels = new PlanarYUVLuminanceSource(
-                            data, s.width, s.height, 0, 0, s.width, s.height, false);
-                    text = new QRCodeReader().decode(new BinaryBitmap(new HybridBinarizer(pixels))).getText();
-                } catch (ReaderException ignored) { }
-                final String link = text;
-                main.post(() -> {
-                    if (source != camera || isFinishing()) return;
-                    if (link != null) {
-                        try {
-                            Endpoint.parse(link);
-                            setResult(RESULT_OK, new Intent().putExtra("link", link));
-                            finish();
-                            return;
-                        } catch (IllegalArgumentException e) { hint.setText(e.getMessage()); }
-                    }
+        Camera active = camera;
+        Camera.Size size = previewSize;
+        if (active == null || size == null || !resumed || isFinishing()) return;
+        try {
+            active.setOneShotPreviewCallback((data, source) -> {
+                if (source != camera || !resumed || isFinishing()) return;
+                if (data == null || data.length < size.width * size.height) {
                     main.postDelayed(this::next, 110);
-                });
+                    return;
+                }
+                try { worker.execute(() -> decode(source, data, size)); }
+                catch (RejectedExecutionException ignored) { }
             });
+        } catch (RuntimeException e) {
+            closeCamera();
+            hint.setText("Camera unavailable. You can enter a pairing link.");
+        }
+    }
+
+    private void decode(Camera source, byte[] data, Camera.Size size) {
+        String text = null;
+        try {
+            PlanarYUVLuminanceSource pixels = new PlanarYUVLuminanceSource(
+                    data, size.width, size.height, 0, 0, size.width, size.height, false);
+            text = new QRCodeReader().decode(new BinaryBitmap(new HybridBinarizer(pixels))).getText();
+        } catch (ReaderException ignored) { }
+        final String link = text;
+        main.post(() -> {
+            if (source != camera || !resumed || isFinishing()) return;
+            if (link != null) {
+                try {
+                    Endpoint.parse(link);
+                    setResult(RESULT_OK, new Intent().putExtra("link", link));
+                    finish();
+                    return;
+                } catch (IllegalArgumentException e) { hint.setText(e.getMessage()); }
+            }
+            main.postDelayed(this::next, 110);
         });
     }
 
     private void closeCamera() {
         main.removeCallbacksAndMessages(null);
-        if (camera != null) {
-            camera.setPreviewCallback(null);
-            camera.release();
-            camera = null;
+        Camera old = camera;
+        camera = null;
+        previewSize = null;
+        if (old != null) {
+            try { old.setPreviewCallback(null); }
+            catch (RuntimeException ignored) { }
+            old.release();
         }
     }
 

@@ -15,11 +15,22 @@ trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/gen" "$work/classes" "$work/dex" "$work/assets/licenses"
 cp licenses/ZXing.txt "$work/assets/licenses/"
 zxing=${ZXING_JAR:-"$out/zxing-core-3.5.3.jar"}
-if [[ ! -f "$zxing" ]]; then
+zxing_sha=8d8064c1636fdaef7189dd9055c7d59950a8940a12f2293956446ec3c109fd82
+valid_zxing() {
+    [[ -f "$1" ]] && printf '%s  %s\n' "$zxing_sha" "$1" | sha256sum --check --status
+}
+if ! valid_zxing "$zxing"; then
+    if [[ -n ${ZXING_JAR:-} ]]; then
+        echo 'ZXING_JAR must point to an intact ZXing core 3.5.3 jar.' >&2
+        exit 1
+    fi
     curl -fsSL --retry 2 https://repo.maven.apache.org/maven2/com/google/zxing/core/3.5.3/core-3.5.3.jar -o "$work/zxing.jar"
+    if ! valid_zxing "$work/zxing.jar"; then
+        echo 'The downloaded ZXing core jar did not match its pinned checksum.' >&2
+        exit 1
+    fi
     mv "$work/zxing.jar" "$zxing"
 fi
-echo "8d8064c1636fdaef7189dd9055c7d59950a8940a12f2293956446ec3c109fd82  $zxing" | sha256sum --check --status
 "$bt/aapt2" compile --dir res -o "$work/res.zip"
 "$bt/aapt2" link -I "$platform" --manifest AndroidManifest.xml --java "$work/gen" \
     -A "$work/assets" -o "$work/resources.apk" "$work/res.zip"

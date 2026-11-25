@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+unit=s-pen-mirror.service
+project=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+
+state() {
+    systemctl --user is-active "$unit" 2>/dev/null || true
+}
+
+case ${1:-status} in
+    status)
+        icon=$'\uf040'
+        case $(state) in
+            active) color='#a3be8c'; class=on; label='On · Click to stop' ;;
+            activating) color='#ebcb8b'; class=starting; label='Starting…' ;;
+            deactivating) color='#ebcb8b'; class=stopping; label='Stopping…' ;;
+            inactive|unknown|failed) color='#a8b3c5'; class=off; label='Off · Click to start' ;;
+            *) color='#bf616a'; class=unavailable; label='Desktop session unavailable' ;;
+        esac
+        printf '{"text":"<span color=\x27%s\x27>%s</span>","class":"%s","tooltip":"S-Pen Mirror · %s"}\n' \
+            "$color" "$icon" "$class" "$label"
+        ;;
+    toggle)
+        exec 9>"${XDG_RUNTIME_DIR:?Requires a desktop session}/s-pen-mirror-toggle.lock"
+        flock -n 9 || exit 0
+        case $(state) in
+            active|activating|reloading)
+                systemctl --user stop "$unit"
+                ;;
+            deactivating)
+                exit 0
+                ;;
+            *)
+                environment=()
+                for key in DISPLAY WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE XDG_CURRENT_DESKTOP \
+                           XDG_SESSION_TYPE GDK_BACKEND QT_QPA_PLATFORM QT_QPA_PLATFORMTHEME PATH; do
+                    if [[ -v $key ]]; then environment+=("--setenv=$key=${!key}"); fi
+                done
+                if ! systemd-run --user --quiet --collect --unit="$unit" --description='S-Pen Mirror' \
+                        --property=Type=notify --property=TimeoutStartSec=20s --property=TimeoutStopSec=5s \
+                        --property=PartOf=graphical-session.target --expand-environment=no \
+                        "${environment[@]}" -- "$project/s-pen-mirror"; then
+                    if command -v notify-send >/dev/null; then
+                        notify-send 'S-Pen Mirror could not start' 'Open the user journal for s-pen-mirror.service for details.' || true
+                    fi
+                    exit 1
+                fi
+                ;;
+        esac
+        ;;
+    *) printf 'Usage: %s [status|toggle]\n' "${0##*/}" >&2; exit 2 ;;
+esac

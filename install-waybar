@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Install the S-Pen Mirror toggle in an existing single-bar Waybar config."""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+from pathlib import Path
+
+from desktop.install_config import backup_config, replace_config
+
+
+MODULE = "custom/s-pen-mirror"
+TOKENS = re.compile(r'"(?:[^"\\]|\\.)*"|//[^\r\n]*|/\*[\s\S]*?\*/|[{}\[\]:,]|[^{}\[\]:,\s/"]+|\S')
+
+
+def add_button(original, controller):
+    tokens = [token for token in TOKENS.finditer(original) if not token[0].startswith(("//", "/*"))]
+    parts = [token[0] for token in tokens]
+    config = json.loads(" ".join(part for i, part in enumerate(parts)
+                                 if not (part == "," and parts[i + 1:i + 2] in (["}"], ["]"]))))
+    if not isinstance(config, dict) or not isinstance(config.get("modules-right"), list):
+        raise ValueError("Expected one Waybar configuration with a modules-right list.")
+    listed = any(MODULE in config.get(section, []) for section in ("modules-left", "modules-center", "modules-right"))
+    if MODULE in config and listed:
+        return original, config
+
+    depth = 0
+    for i, part in enumerate(parts):
+        if depth == 1 and part == '"modules-right"' and parts[i + 1:i + 3] == [":", "["]:
+            first = i + 3
+            last = parts.index("]", first)
+            target = next((j for j in range(first, last) if parts[j] == '"tray"'), first)
+            position = tokens[target].start()
+            entry = "" if listed else json.dumps(MODULE) + (", " if first != last else "")
+            break
+        if part in ("{", "["):
+            depth += 1
+        elif part in ("}", "]"):
+            depth -= 1
+    else:
+        raise ValueError("The modules-right list could not be located.")
+
+    command = shlex.quote(str(controller))
+    settings = {"exec": f"{command} status", "on-click": f"{command} toggle", "return-type": "json",
+                "interval": 2, "format": "{}", "escape": False}
+    definition = "" if MODULE in config else "\n    " + json.dumps(MODULE) + ": " + json.dumps(settings) + ","
+    root = tokens[0].end()
+    return original[:root] + definition + original[root:position] + entry + original[position:], config
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, help="Path to a Waybar configuration")
+    parser.add_argument("--no-reload", action="store_true", help="Save without reloading Waybar")
+    args = parser.parse_args()
+    try:
+        config_dir = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "waybar"
+        path = args.config or next((config_dir / name for name in ("config", "config.jsonc")
+                                   if (config_dir / name).is_file()), None)
+        if path is None:
+            raise ValueError(f"No Waybar configuration found in {config_dir}.")
+        path = path.resolve(strict=True)
+        original = path.read_text(encoding="utf-8")
+        controller = Path(__file__).resolve().parent / "desktop/waybar-toggle"
+        updated, config = add_button(original, controller)
+        if updated == original:
+            print(f"S-Pen Mirror is already in {path}.")
+            return
+        backup = backup_config(path)
+        replace_config(path, updated)
+    except (OSError, ValueError) as error:
+        parser.exit(1, f"Could not install the Waybar toggle. {error}\n")
+
+    print(f"Added S-Pen Mirror to {path}. Original configuration saved to {backup}.")
+    if not args.no_reload and config.get("on-sigusr2", "reload") == "reload" and shutil.which("pkill"):
+        subprocess.run(["pkill", "-USR2", "-u", str(os.getuid()), "-x", "waybar"], check=False)
+
+
+if __name__ == "__main__":
+    main()

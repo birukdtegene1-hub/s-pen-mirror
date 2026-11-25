@@ -21,6 +21,7 @@ import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.SystemClock;
 import android.util.DisplayMetrics;
+import android.util.Log;
 import android.view.Display;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -29,6 +30,7 @@ import java.nio.ByteOrder;
 public final class MirrorService extends Service {
     static final String STOP = "ink.relay.STOP";
     private static final int NOTICE = 21;
+    private RelayApp app;
     private Link link;
     private HandlerThread thread;
     private Handler worker;
@@ -40,10 +42,10 @@ public final class MirrorService extends Service {
     private long lastFrame;
     private boolean started, queued;
     private volatile boolean ending;
-    private volatile String message;
+    private String message;
     private int[] argb;
     private final Runnable checkLink = () -> {
-        if (started && (link.state != Link.State.ONLINE || !link.screen)) stopSelf();
+        if (started && (link.state != Link.State.ONLINE || !link.screen)) finishCapture(null);
     };
     private final MediaProjection.Callback callback = new MediaProjection.Callback() {
         @Override public void onStop() { finishCapture(null); }
@@ -62,7 +64,8 @@ public final class MirrorService extends Service {
 
     @Override public void onCreate() {
         super.onCreate();
-        link = ((RelayApp) getApplication()).link;
+        app = (RelayApp) getApplication();
+        link = app.link;
         link.listen(checkLink);
         displays = getSystemService(DisplayManager.class);
         thread = new HandlerThread("screen-capture");
@@ -72,12 +75,13 @@ public final class MirrorService extends Service {
 
     @Override public int onStartCommand(Intent intent, int flags, int id) {
         if (intent == null || STOP.equals(intent.getAction())) {
-            stopSelf();
+            finishCapture(null);
             return START_NOT_STICKY;
         }
         if (started) return START_NOT_STICKY;
         try {
-            Intent grant = intent.getParcelableExtra("grant");
+            Intent grant = Build.VERSION.SDK_INT >= 33 ? intent.getParcelableExtra("grant", Intent.class)
+                    : intent.getParcelableExtra("grant");
             NotificationManager manager = getSystemService(NotificationManager.class);
             manager.createNotificationChannel(new NotificationChannel("screen", "Screen mirroring",
                     NotificationManager.IMPORTANCE_LOW));
@@ -91,7 +95,7 @@ public final class MirrorService extends Service {
                     .setContentIntent(open).addAction(new Notification.Action.Builder(null, "Stop sharing", stop).build())
                     .build();
             startForeground(NOTICE, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
-            if (grant == null || !link.setScreen(true, null)) { stopSelf(); return START_NOT_STICKY; }
+            if (grant == null || !link.setScreen(true, null)) { finishCapture(null); return START_NOT_STICKY; }
             started = true;
             worker.post(() -> begin(grant));
         } catch (RuntimeException e) {
@@ -191,9 +195,17 @@ public final class MirrorService extends Service {
     }
 
     private void finishCapture(String reason) {
-        if (ending) return;
-        message = reason;
-        stopSelf();
+        link.main.post(() -> {
+            if (ending) return;
+            ending = true;
+            message = reason;
+            stopSelf();
+        });
+    }
+
+    private static void releaseSafely(Runnable action) {
+        try { action.run(); }
+        catch (RuntimeException e) { Log.w("S-Pen Mirror", "Could not release screen capture", e); }
     }
 
     @Override public void onDestroy() {
@@ -203,15 +215,19 @@ public final class MirrorService extends Service {
         stopForeground(STOP_FOREGROUND_REMOVE);
         worker.post(() -> {
             worker.removeCallbacksAndMessages(null);
-            displays.unregisterDisplayListener(rotation);
-            if (display != null) display.release();
-            if (reader != null) reader.close();
-            if (projection != null) {
-                projection.unregisterCallback(callback);
-                projection.stop();
+            try {
+                releaseSafely(() -> displays.unregisterDisplayListener(rotation));
+                if (display != null) releaseSafely(display::release);
+                if (reader != null) releaseSafely(reader::close);
+                if (projection != null) {
+                    releaseSafely(() -> projection.unregisterCallback(callback));
+                    releaseSafely(projection::stop);
+                }
+            } finally {
+                argb = null;
+                thread.quitSafely();
+                link.main.post(app::releaseMirror);
             }
-            argb = null;
-            thread.quitSafely();
         });
         super.onDestroy();
     }
