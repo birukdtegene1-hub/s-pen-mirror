@@ -19,11 +19,18 @@ from pathlib import Path
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QImage, QImageReader, QPainter
 
+from desktop.cast import CastRegion, focus_adjacent_monitor
+from desktop.pointer import PointerSession, decode_pointer
+
 
 MAX_FRAME = 8 * 1024 * 1024
 MAX_SIDE = 2048
 CAST_PROTOCOL = "spen-region-1"
 CANCEL_PROTOCOL = "spen-region-2"
+STROKE_PROTOCOL = "spen-region-3"
+TOUCHPAD_PROTOCOL = "spen-region-4"
+MONITOR_PROTOCOL = "spen-region-5"
+MAGNIFIER_PROTOCOL = "spen-region-6"
 PAIRING_TIMEOUT = 3
 CLIPBOARD_TIMEOUT = 90
 CAST_SELECT, CAST_WAIT, CAST_ERROR, CAST_READY, CAST_PAUSED = range(5)
@@ -66,7 +73,8 @@ def tls_identity():
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_3
-        context.set_alpn_protocols([CANCEL_PROTOCOL, CAST_PROTOCOL])
+        context.set_alpn_protocols([MAGNIFIER_PROTOCOL, MONITOR_PROTOCOL, TOUCHPAD_PROTOCOL,
+                                    STROKE_PROTOCOL, CANCEL_PROTOCOL, CAST_PROTOCOL])
         context.load_cert_chain(cert, key)
         fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert.read_text())).hexdigest()
         return context, fingerprint
@@ -84,9 +92,13 @@ class LiveView:
         self.annotation_events = []
         self.annotation_origin = None
         self.region = None
+        self.selected_region = None
+        self.pdf_context = None
         self.cast_revision = 0
         self.cast_status = CAST_SELECT
         self.cast_image = None
+        self.cast_zoom = 1
+        self.cast_transform = None
         self.capture_errors = 0
 
     def show(self, mode, image=None):
@@ -97,6 +109,8 @@ class LiveView:
             self.image = QImage(image) if image is not None else QImage()
             if self.region is not None or mode == "cast":
                 self.region = None
+                self.selected_region = None
+                self.cast_zoom = 1
                 self._invalidate_cast()
             self.version += 1
 
@@ -111,7 +125,7 @@ class LiveView:
             context = (key, bounds, monitor)
             if context != self.desktop_context:
                 self.desktop_context = context
-                if self.region is not None:
+                if self.region is not None and self.pdf_context is None:
                     self._invalidate_cast()
 
     def current_desktop_context(self):
@@ -124,17 +138,72 @@ class LiveView:
 
     def set_region(self, region):
         with self.lock:
-            if self.mode != "cast":
+            if self.mode != "cast" or self.pdf_context is not None:
                 return False
-            self.region = region
+            self._finish_annotation()
+            self.region = self.selected_region = region
+            if region is None:
+                self.cast_zoom = 1
             self._invalidate_cast()
             return True
+
+    def switch_monitor(self, direction):
+        with self.lock:
+            origin, pdf = self.region, self.pdf_context
+            if self.mode != "cast" or (origin is None and pdf is None):
+                return
+        target = focus_adjacent_monitor(origin.monitor if origin is not None else None, direction)
+        if target is None or origin is None:
+            return
+        full = CastRegion.from_monitor(target)
+        with self.lock:
+            if self.mode != "cast" or self.region is not origin:
+                return
+            self._finish_annotation()
+            saved = self.selected_region
+            self.region = full
+            if saved is not None and (saved.monitor, saved.bounds, saved.scale) == (full.monitor, full.bounds, full.scale):
+                self.region = saved
+            self._invalidate_cast()
+
+    def set_pdf_page(self, context):
+        with self.lock:
+            if self.pdf_context == context:
+                return
+            self._finish_annotation()
+            self.pdf_context = context
+            self.region = None
+            self.selected_region = None
+            self._invalidate_cast()
+
+    def pdf_target(self):
+        with self.lock:
+            return (self.cast_revision, self.pdf_context) if self.mode == "cast" and self.pdf_context else None
+
+    def has_cast_target(self):
+        with self.lock:
+            return self.mode == "cast" and (self.region is not None or self.pdf_context is not None)
+
+    def set_cast_zoom(self, factor):
+        with self.lock:
+            if self.mode == "cast" and factor != self.cast_zoom:
+                self.cast_zoom = factor
+                if self.region is not None:
+                    self._finish_annotation()
+                    self._invalidate_cast()
+
+    def zoom_at(self, revision):
+        with self.lock:
+            return self.cast_zoom if revision == self.cast_revision else None
 
     def _invalidate_cast(self):
         self.cast_revision += 1
         self.cast_image = None
+        self.cast_transform = None
         self.capture_errors = 0
-        if self.region is None:
+        if self.pdf_context is not None and self.mode == "cast":
+            self.cast_status = CAST_WAIT
+        elif self.region is None:
             self.cast_status = CAST_SELECT
         elif self._region_on_active_display():
             self.cast_status = CAST_WAIT
@@ -148,13 +217,13 @@ class LiveView:
 
     def capture_target(self):
         with self.lock:
-            if self.region is not None and self._region_on_active_display():
+            if self.region is not None and self.pdf_context is None and self._region_on_active_display():
                 return self.cast_revision, self.region
             return None
 
-    def publish_capture(self, revision, data):
+    def publish_capture(self, revision, data, transform=None):
         with self.lock:
-            if self.region is None or revision != self.cast_revision:
+            if self.mode != "cast" or (self.region is None and self.pdf_context is None) or revision != self.cast_revision:
                 return False
             previous = self.cast_status
             changed = False
@@ -168,6 +237,7 @@ class LiveView:
             else:
                 self.capture_errors = 0
                 self.cast_status = CAST_READY
+                self.cast_transform = transform
                 if data != self.cast_image:
                     self.cast_image = data
                     changed = True
@@ -191,7 +261,8 @@ class LiveView:
             if self.mode == "cast":
                 if revision != self.cast_revision or self.cast_status != CAST_READY:
                     return
-                event = self.region.map_annotation(event)
+                if self.pdf_context is None:
+                    event = self.region.map_annotation(event, self.cast_transform)
             if action != "move":
                 self._finish_annotation()
             if action == "move":
@@ -201,7 +272,8 @@ class LiveView:
             else:
                 if len(self.annotation_events) >= 1023:
                     return
-                context = (*self.desktop_context, revision)
+                target = self.pdf_context if self.mode == "cast" and self.pdf_context else self.desktop_context
+                context = (*target, revision)
                 if action == "start":
                     self.annotation_origin = context
             self._queue_annotation(context, event)
@@ -255,13 +327,13 @@ def decode_image(data, image_format):
     return image
 
 
-def decode_annotation(data, cancel_supported=False):
+def decode_annotation(data, cancel_supported=False, stroke_supported=False):
     action = data[:1]
     if action == b"S" and len(data) == 30:
         _, x, y, pressure, tool, color, size, page_width, page_height = struct.unpack(
             "!cfffBifII", data
         )
-        if tool > 3 or not (1 <= page_width <= 10000 and 1 <= page_height <= 10000):
+        if tool > (4 if stroke_supported else 3) or not (1 <= page_width <= 10000 and 1 <= page_height <= 10000):
             raise ValueError("Invalid annotation settings")
         if not (1 <= size <= 36):
             raise ValueError("Invalid annotation width")
@@ -287,7 +359,8 @@ def decode_annotation(data, cancel_supported=False):
     raise ValueError("Invalid annotation event")
 
 
-def receive_frames(stream, view, cast_supported=False, cancel_supported=False):
+def receive_frames(stream, view, cast_supported=False, cancel_supported=False, stroke_supported=False, pointer=None,
+                   monitor_supported=False, magnifier_supported=False):
     mode = "ink"
     page = QImage()
     last_capture = None
@@ -301,24 +374,42 @@ def receive_frames(stream, view, cast_supported=False, cancel_supported=False):
             if size:
                 raise ValueError("Unexpected control data")
             if kind != b"H":
+                if pointer is not None:
+                    pointer.close()
                 mode = {b"B": "ink", b"M": "screen", b"W": "write"}[kind]
                 page = QImage()
                 view.show(mode)
         elif cast_supported and kind == b"V" and size == 0:
+            if pointer is not None:
+                pointer.close()
             mode = "cast"
             page = QImage()
             last_capture = None
             last_revision = None
             view.show(mode)
         elif mode == "cast" and kind == b"F" and size == 0:
+            pointer_state = b"" if pointer is None else bytes((pointer.update(view.has_cast_target()),))
             status, revision, picture = view.capture_update()
             data = picture if picture is not last_capture or revision != last_revision else None
-            stream.sendall(struct.pack("!cBII", b"+", status, revision, len(data or b"")))
+            stream.sendall(struct.pack("!cBII", b"+", status, revision, len(data or b"")) + pointer_state)
             if data:
                 stream.sendall(data)
             last_capture = picture
             last_revision = revision
             continue
+        elif mode == "cast" and kind == b"T" and pointer is not None and 1 <= size <= 9:
+            event = decode_pointer(read_exact(stream, size))
+            if event[0] == b"N":
+                if not monitor_supported:
+                    raise ValueError("Monitor switching requires the negotiated protocol")
+                if pointer.update(view.has_cast_target()):
+                    view.switch_monitor(event[1])
+            else:
+                if event[0] == b"Z" and not magnifier_supported:
+                    raise ValueError("Desktop zoom requires the negotiated protocol")
+                level = pointer.handle(event, view.has_cast_target())
+                if event[0] == b"Z" and level is not None:
+                    view.set_cast_zoom(level)
         elif mode == "ink" and kind == b"I":
             page = decode_image(read_exact(stream, size), b"png").convertToFormat(
                 QImage.Format.Format_RGB32
@@ -340,7 +431,7 @@ def receive_frames(stream, view, cast_supported=False, cancel_supported=False):
                 raise ValueError("Invalid annotation event size")
             data = read_exact(stream, size)
             revision = struct.unpack("!I", data[:prefix])[0] if prefix else None
-            view.add_annotation(decode_annotation(data[prefix:], cancel_supported), revision)
+            view.add_annotation(decode_annotation(data[prefix:], cancel_supported, stroke_supported), revision)
         else:
             raise ValueError("Unexpected frame")
         stream.sendall(b"+")
@@ -364,10 +455,12 @@ def receive_session(stream, token, active, view, cast_supported=False):
         receive_paired(stream, active, view, cast_supported)
 
 
-def receive_paired(stream, active, view, cast_supported, cancel_supported=False, authorize=None):
+def receive_paired(stream, active, view, cast_supported, cancel_supported=False, authorize=None,
+                   stroke_supported=False, touchpad_supported=False, monitor_supported=False, magnifier_supported=False):
     if not active.acquire(blocking=False):
         stream.sendall(b"*")
         return
+    pointer = PointerSession() if touchpad_supported else None
     try:
         stream.settimeout(15)
         token = authorize() if authorize is not None else ""
@@ -375,8 +468,11 @@ def receive_paired(stream, active, view, cast_supported, cancel_supported=False,
             stream.sendall(b"!")
             return
         stream.sendall(b"+" + (token.encode("ascii") if cancel_supported else b""))
-        receive_frames(stream, view, cast_supported, cancel_supported)
+        receive_frames(stream, view, cast_supported, cancel_supported, stroke_supported, pointer,
+                       monitor_supported, magnifier_supported)
     finally:
+        if pointer is not None:
+            pointer.close()
         view.show("pair")
         active.release()
 
@@ -395,6 +491,7 @@ class Receiver:
         self.pending = {}
         self.retry_after = OrderedDict()
         self.connections = set()
+        self.workers = set()
         self.closed = threading.Event()
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -453,12 +550,16 @@ class Receiver:
             if not self.admit(host, raw):
                 raw.close()
                 continue
+            worker = threading.Thread(target=self.serve, args=(raw, host, deadline), daemon=True)
             try:
-                threading.Thread(target=self.serve, args=(raw, host, deadline), daemon=True).start()
+                with self.admission:
+                    self.workers.add(worker)
+                    worker.start()
             except RuntimeError:
                 self.release_pending(host)
                 with self.admission:
                     self.connections.discard(raw)
+                    self.workers.discard(worker)
                 raw.close()
 
     def admit(self, host, raw):
@@ -502,9 +603,13 @@ class Receiver:
                     self.release_pending(host)
                     pending = False
                     protocol = stream.selected_alpn_protocol()
+                    monitor = protocol in (MAGNIFIER_PROTOCOL, MONITOR_PROTOCOL)
+                    touchpad = monitor or protocol == TOUCHPAD_PROTOCOL
+                    extended = touchpad or protocol in (CANCEL_PROTOCOL, STROKE_PROTOCOL)
                     receive_paired(stream, self.active, self.view,
-                                   protocol in (CAST_PROTOCOL, CANCEL_PROTOCOL), protocol == CANCEL_PROTOCOL,
-                                   lambda: self.authorize(token, protocol == CANCEL_PROTOCOL))
+                                   extended or protocol == CAST_PROTOCOL, extended,
+                                   lambda: self.authorize(token, extended),
+                                   touchpad or protocol == STROKE_PROTOCOL, touchpad, monitor, protocol == MAGNIFIER_PROTOCOL)
         except (OSError, EOFError, ValueError):
             pass
         finally:
@@ -512,13 +617,18 @@ class Receiver:
                 self.release_pending(host, failed=True)
             with self.admission:
                 self.connections.discard(stream)
+                self.workers.discard(threading.current_thread())
 
     def close(self):
         self.closed.set()
         self.listener.close()
         with self.admission:
+            workers = tuple(self.workers)
             for stream in self.connections:
                 try:
                     stream.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     pass
+        deadline = time.monotonic() + 1
+        for worker in workers:
+            worker.join(max(0, deadline - time.monotonic()))

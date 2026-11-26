@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QLineF, QPointF, QRect, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QImage, QPainter, QPen
+from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPainterPathStroker, QPen, QTransform
 from PySide6.QtWidgets import QApplication, QWidget
 
 from desktop.cast import monitor_bounds
@@ -116,10 +116,12 @@ class InkEdit:
     after: QImage
     had_ink: bool
     has_ink: bool
+    previous_marks: tuple
+    next_marks: tuple
 
     @property
     def bytes(self):
-        return self.before.sizeInBytes() + self.after.sizeInBytes()
+        return self.before.sizeInBytes() + self.after.sizeInBytes() + 8 * (len(self.previous_marks) + len(self.next_marks))
 
 
 class CanvasState:
@@ -129,16 +131,18 @@ class CanvasState:
         self.undo = []
         self.redo = []
         self.has_ink = False
+        self.marks = ()
         self.history_bytes = 0
 
-    def remember(self, before, dirty, had_ink):
+    def remember(self, before, dirty, had_ink, previous_marks):
         if dirty.isEmpty():
             return
         self.history_bytes -= sum(edit.bytes for edit in self.redo)
         self.redo.clear()
         width, height = self.image.width(), self.image.height()
         bounds = QRectF(dirty.x() / width, dirty.y() / height, dirty.width() / width, dirty.height() / height)
-        edit = InkEdit(bounds, before.copy(dirty), self.image.copy(dirty), had_ink, self.has_ink)
+        edit = InkEdit(bounds, before.copy(dirty), self.image.copy(dirty), had_ink, self.has_ink,
+                      previous_marks, self.marks)
         self.undo.append(edit)
         self.history_bytes += edit.bytes
         if len(self.undo) > HISTORY_LIMIT:
@@ -162,15 +166,17 @@ class CanvasState:
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             painter.drawImage(rect, edit.after if forward else edit.before)
         self.has_ink = edit.has_ink if forward else edit.had_ink
+        self.marks = edit.next_marks if forward else edit.previous_marks
 
 
 class DesktopAnnotations(QWidget):
-    def __init__(self, view):
+    def __init__(self, view, pdf_events=None):
         flags = (Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
                  | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowDoesNotAcceptFocus
                  | Qt.WindowType.WindowTransparentForInput)
         super().__init__(None, flags)
         self.view = view
+        self.pdf_events = pdf_events
         self.context_watcher = DesktopContext(view)
         self.canvases = OrderedDict()
         self.current_key = None
@@ -233,8 +239,15 @@ class DesktopAnnotations(QWidget):
         if self.layer is not None:
             self.layer.dispatch()
         (key, bounds, monitor), _, events = self.view.take_annotation_update()
-        for event_key, event_bounds, _, event, _ in events:
-            self._apply(event_key, event_bounds, event)
+        pdf = []
+        for entry in events:
+            event_key, event_bounds, _, event, _ = entry
+            if isinstance(event_key, tuple):
+                pdf.append(entry)
+            else:
+                self._apply(event_key, event_bounds, event)
+        if pdf and self.pdf_events is not None:
+            self.pdf_events(pdf)
         if events:
             self._prune_canvases(key)
         if not self.enabled:
@@ -288,7 +301,7 @@ class DesktopAnnotations(QWidget):
         if action == "start":
             self._finish_stroke()
             existing = self.canvases.get(key)
-            if event["tool"] == 3 and (existing is None or not existing.has_ink):
+            if event["tool"] >= 3 and (existing is None or not existing.has_ink):
                 return
             state = self._state(key, bounds)
             stroke = {name: event[name] for name in
@@ -298,7 +311,8 @@ class DesktopAnnotations(QWidget):
                 mask = QImage(state.image.size(), state.image.format())
                 mask.fill(Qt.GlobalColor.transparent)
             stroke.update(clip=event.get("clip"), previous=None, dirty=QRect(), before=QImage(state.image),
-                          had_ink=state.has_ink, mask=mask)
+                          had_ink=state.has_ink, previous_marks=state.marks, mask=mask, coverage=QPainterPath())
+            stroke["coverage"].setFillRule(Qt.FillRule.WindingFill)
             self.active_key = key
             self.active_stroke = stroke
             self._add_point(state, stroke, event)
@@ -314,9 +328,11 @@ class DesktopAnnotations(QWidget):
             state = self._state(key, bounds)
             if action == "clear" and state.has_ink:
                 before = QImage(state.image)
+                previous_marks = state.marks
                 state.image.fill(Qt.GlobalColor.transparent)
                 state.has_ink = False
-                state.remember(before, state.image.rect(), True)
+                state.marks = ()
+                state.remember(before, state.image.rect(), True, previous_marks)
             elif action in ("undo", "redo"):
                 state.step(action == "redo")
 
@@ -326,6 +342,13 @@ class DesktopAnnotations(QWidget):
         if previous == point:
             return
         stroke["previous"] = point
+        coverage = self._footprint(state.image, stroke, previous, point)
+        if stroke["tool"] == 4:
+            if stroke["clip"] is not None:
+                coverage = coverage.intersected(self._clip_path(stroke["clip"]))
+            stroke["dirty"] |= self._erase_strokes(state, coverage)
+            return
+        stroke["coverage"].addPath(coverage)
         mask = stroke["mask"]
         stroke["dirty"] |= self._paint_segment(state.image if mask is None else mask, stroke, previous, point)
         state.has_ink |= stroke["tool"] not in (2, 3)
@@ -338,9 +361,62 @@ class DesktopAnnotations(QWidget):
             width *= 0.23 + 1.35 * max(0, min(1, pressure))
         elif stroke["tool"] == 2:
             width *= 3
-        elif stroke["tool"] == 3:
+        elif stroke["tool"] >= 3:
             width *= 3.5
         return max(1, width)
+
+    @staticmethod
+    def _clip_path(clip):
+        shape = QPainterPath()
+        shape.addRect(QRectF(*clip))
+        return shape
+
+    def _footprint(self, image, stroke, previous, point):
+        image_w, image_h = image.width(), image.height()
+        previous = previous or point
+        first = QPointF(previous[0] * (image_w - 1), previous[1] * (image_h - 1))
+        last = QPointF(point[0] * (image_w - 1), point[1] * (image_h - 1))
+        pressure = point[2] if first == last else (point[2] + previous[2]) / 2
+        width = self._stroke_width(image, stroke, pressure)
+        if first == last:
+            shape = QPainterPath()
+            shape.addEllipse(last, width / 2, width / 2)
+        else:
+            line = QPainterPath(first)
+            line.lineTo(last)
+            stroker = QPainterPathStroker()
+            stroker.setWidth(width)
+            stroker.setCapStyle(Qt.PenCapStyle.RoundCap)
+            shape = stroker.createStroke(line)
+        return QTransform.fromScale(1 / image_w, 1 / image_h).map(shape)
+
+    @staticmethod
+    def _erase_strokes(state, eraser):
+        kept = []
+        dirty = QRectF()
+        for path, color in state.marks:
+            if path.intersects(eraser):
+                dirty = dirty.united(path.boundingRect())
+            else:
+                kept.append((path, color))
+        if len(kept) == len(state.marks):
+            return QRect()
+        state.marks = tuple(kept)
+        state.has_ink = bool(kept)
+        w, h = state.image.width(), state.image.height()
+        pixels = QTransform.fromScale(w, h).mapRect(dirty).toAlignedRect().adjusted(-2, -2, 2, 2)
+        pixels = pixels.intersected(state.image.rect())
+        with QPainter(state.image) as painter:
+            painter.setClipRect(pixels)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+            painter.fillRect(pixels, Qt.GlobalColor.black)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.scale(w, h)
+            for path, color in kept:
+                if path.boundingRect().intersects(dirty.adjusted(-2 / w, -2 / h, 2 / w, 2 / h)):
+                    painter.fillPath(path, QColor.fromRgba(color))
+        return pixels
 
     def _paint_segment(self, image, stroke, previous, point):
         pressure = point[2] if previous is None or previous[:2] == point[:2] else (point[2] + previous[2]) / 2
@@ -394,13 +470,30 @@ class DesktopAnnotations(QWidget):
                     painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
                     painter.drawImage(dirty, before, dirty)
             state.has_ink = stroke["had_ink"]
+            state.marks = stroke["previous_marks"]
             return
         if mask is not None:
             with QPainter(state.image) as painter:
                 painter.setOpacity(HIGHLIGHT_OPACITY)
                 painter.drawImage(dirty, mask, dirty)
             state.has_ink = True
-        state.remember(before, dirty, stroke["had_ink"])
+        coverage = stroke["coverage"]
+        if stroke["clip"] is not None:
+            coverage = coverage.intersected(self._clip_path(stroke["clip"]))
+        if stroke["tool"] < 3 and not coverage.isEmpty():
+            color = QColor.fromRgba(stroke["color"])
+            if stroke["tool"] == 2:
+                color.setAlpha(92)
+            state.marks += ((coverage, color.rgba()),)
+        elif stroke["tool"] == 3:
+            cut = []
+            for path, color in state.marks:
+                remaining = path.subtracted(coverage) if path.intersects(coverage) else path
+                if not remaining.isEmpty():
+                    cut.append((remaining, color))
+            state.marks = tuple(cut)
+            state.has_ink = bool(cut)
+        state.remember(before, dirty, stroke["had_ink"], stroke["previous_marks"])
 
     def _prune_canvases(self, displayed):
         protected = {displayed, self.active_key}

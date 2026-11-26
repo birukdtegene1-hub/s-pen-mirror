@@ -29,6 +29,10 @@ import javax.net.ssl.X509TrustManager;
 final class Link {
     private static final String CAST_PROTOCOL = "spen-region-1";
     private static final String CANCEL_PROTOCOL = "spen-region-2";
+    private static final String STROKE_PROTOCOL = "spen-region-3";
+    private static final String TOUCHPAD_PROTOCOL = "spen-region-4";
+    private static final String MONITOR_PROTOCOL = "spen-region-5";
+    private static final String MAGNIFIER_PROTOCOL = "spen-region-6";
     private static final int CAST_POLL_MS = 75, MAX_CAST_BYTES = 8 * 1024 * 1024;
     enum State { OFFLINE, CONNECTING, ONLINE }
     final Handler main = new Handler(Looper.getMainLooper());
@@ -38,6 +42,9 @@ final class Link {
     volatile boolean screen;
     volatile boolean writing;
     volatile boolean castSupported;
+    volatile boolean touchpadSupported;
+    volatile boolean monitorSwipeSupported;
+    volatile boolean magnifierSupported;
     volatile CastFrame castFrame = CastFrame.EMPTY;
     volatile String status = "Local canvas";
     volatile Endpoint endpoint;
@@ -47,7 +54,7 @@ final class Link {
     private Socket socket;
     private Frame pending;
     private final ArrayDeque<Frame> annotations = new ArrayDeque<>();
-    private boolean cancelSupported;
+    private boolean cancelSupported, strokeSupported;
     private int control;
 
     void listen(Runnable listener) { listeners.add(listener); }
@@ -98,7 +105,11 @@ final class Link {
         screen = false;
         writing = false;
         castSupported = false;
+        touchpadSupported = false;
+        monitorSwipeSupported = false;
+        magnifierSupported = false;
         cancelSupported = false;
+        strokeSupported = false;
         resetCast();
         dropPending();
         annotations.clear();
@@ -170,22 +181,45 @@ final class Link {
         char action = (char) data[0];
         boolean terminal = action == 'E' || action == 'X';
         if (action == 'X' && !cancelSupported) data = new byte[]{'E'};
+        if (action == 'S' && data[13] == InkPage.Tool.STROKE_ERASER.ordinal() && !strokeSupported) {
+            data[13] = (byte) InkPage.Tool.ERASER.ordinal();
+        }
         if (casting()) {
             if (!terminal && (castFrame.status != CastFrame.READY || castFrame.revision != revision)) return false;
             data = ByteBuffer.allocate(4 + data.length).putInt(revision).put(data).array();
         }
-        if (annotations.size() >= (terminal ? 512 : 511)) {
-            if (action == 'M') return false;
-            Frame move = null;
-            for (Frame annotation : annotations) {
-                if (annotation.move) { move = annotation; break; }
-            }
-            if (move == null) return false;
-            annotations.remove(move);
-        }
+        if (!makeSpace(terminal ? 512 : 511, action == 'M')) return false;
         annotations.addLast(new Frame('D', data, action == 'M'));
         notifyAll();
         return true;
+    }
+
+    synchronized boolean offerPointer(byte[] data) {
+        if (!casting() || !castFrame.touchpad || (data[0] == 'N' && !monitorSwipeSupported)
+                || (data[0] == 'Z' && !magnifierSupported)) return false;
+        boolean move = data[0] == 'M' || data[0] == 'S';
+        Frame previous = annotations.peekLast();
+        if (move && previous != null && previous.kind == 'T' && previous.data[0] == data[0]) {
+            ByteBuffer prior = ByteBuffer.wrap(previous.data), next = ByteBuffer.wrap(data);
+            float x = prior.getFloat(1) + next.getFloat(1), y = prior.getFloat(5) + next.getFloat(5);
+            if (Math.abs(x) <= 4096 && Math.abs(y) <= 4096) {
+                annotations.removeLast();
+                next.putFloat(1, x).putFloat(5, y);
+            }
+        }
+        if (!makeSpace(move ? 510 : 512, move)) return false;
+        annotations.addLast(new Frame('T', data, move));
+        notifyAll();
+        return true;
+    }
+
+    private boolean makeSpace(int limit, boolean move) {
+        if (annotations.size() < limit) return true;
+        if (move) return false;
+        for (Frame queued : annotations) {
+            if (queued.move) return annotations.remove(queued);
+        }
+        return false;
     }
 
     private void dropPending() {
@@ -231,11 +265,16 @@ final class Link {
                 tls.setSoTimeout(8000);
                 tls.setEnabledProtocols(new String[]{"TLSv1.3"});
                 SSLParameters parameters = tls.getSSLParameters();
-                parameters.setApplicationProtocols(new String[]{CANCEL_PROTOCOL, CAST_PROTOCOL});
+                parameters.setApplicationProtocols(new String[]{MAGNIFIER_PROTOCOL, MONITOR_PROTOCOL,
+                        TOUCHPAD_PROTOCOL, STROKE_PROTOCOL, CANCEL_PROTOCOL, CAST_PROTOCOL});
                 tls.setSSLParameters(parameters);
                 tls.startHandshake();
                 String protocol = tls.getApplicationProtocol();
-                boolean supportsCancel = CANCEL_PROTOCOL.equals(protocol);
+                boolean supportsMagnifier = MAGNIFIER_PROTOCOL.equals(protocol);
+                boolean supportsMonitorSwipe = supportsMagnifier || MONITOR_PROTOCOL.equals(protocol);
+                boolean supportsTouchpad = supportsMonitorSwipe || TOUCHPAD_PROTOCOL.equals(protocol);
+                boolean supportsStroke = supportsTouchpad || STROKE_PROTOCOL.equals(protocol);
+                boolean supportsCancel = supportsStroke || CANCEL_PROTOCOL.equals(protocol);
                 DataInputStream in = new DataInputStream(tls.getInputStream());
                 DataOutputStream out = new DataOutputStream(new BufferedOutputStream(tls.getOutputStream()));
                 out.write(("SPEN1 " + target.token + "\n").getBytes(StandardCharsets.US_ASCII));
@@ -256,7 +295,11 @@ final class Link {
                 synchronized (this) {
                     if (generation != session) return;
                     castSupported = supportsCancel || CAST_PROTOCOL.equals(protocol);
+                    touchpadSupported = supportsTouchpad;
+                    monitorSwipeSupported = supportsMonitorSwipe;
+                    magnifierSupported = supportsMagnifier;
                     cancelSupported = supportsCancel;
+                    strokeSupported = supportsStroke;
                     endpoint = paired;
                     state = State.ONLINE;
                     status = "Paired · " + target.host;
@@ -308,7 +351,7 @@ final class Link {
                         for (int i = 0; i < Math.max(1, batch.size()); i++) {
                             if (in.read() != '+') throw new IOException("PC disconnected");
                         }
-                        if (kind == 'F') readCastFrame(in, session, epoch);
+                        if (kind == 'F') readCastFrame(in, session, epoch, supportsTouchpad);
                     } finally {
                         batch.clear();
                         main.removeCallbacks(deadline);
@@ -337,10 +380,12 @@ final class Link {
         else frame.write(out);
     }
 
-    private void readCastFrame(DataInputStream in, int session, int epoch) throws IOException {
+    private void readCastFrame(DataInputStream in, int session, int epoch, boolean supportsTouchpad) throws IOException {
         int status = in.readUnsignedByte(), revision = in.readInt(), length = in.readInt();
+        int flags = supportsTouchpad ? in.readUnsignedByte() : 0;
+        boolean touchpad = flags != 0;
         if (status > CastFrame.PAUSED || length < 0 || length > MAX_CAST_BYTES
-                || (status != CastFrame.READY && length != 0)) throw new IOException("Invalid PC preview");
+                || flags > 1 || (status != CastFrame.READY && length != 0)) throw new IOException("Invalid PC preview");
         Bitmap bitmap = null;
         if (length > 0) {
             byte[] jpeg = new byte[length];
@@ -355,23 +400,26 @@ final class Link {
         }
         synchronized (this) {
             if (session != generation || epoch != castEpoch) return;
-            if (bitmap == null && castFrame.status == status && castFrame.revision == revision) return;
-            if (status == CastFrame.WAIT) bitmap = castFrame.bitmap;
-            castFrame = new CastFrame(status, revision, bitmap);
+            boolean samePreview = castFrame.status == status && castFrame.revision == revision;
+            if (bitmap == null && samePreview && castFrame.touchpad == touchpad) return;
+            if (status == CastFrame.WAIT || (bitmap == null && samePreview && status == CastFrame.READY)) bitmap = castFrame.bitmap;
+            castFrame = new CastFrame(status, revision, bitmap, touchpad);
             frameChanged();
         }
     }
 
     static final class CastFrame {
         static final int SELECT = 0, WAIT = 1, ERROR = 2, READY = 3, PAUSED = 4;
-        static final CastFrame EMPTY = new CastFrame(SELECT, 0, null);
+        static final CastFrame EMPTY = new CastFrame(SELECT, 0, null, false);
         final int status, revision;
         final Bitmap bitmap;
+        final boolean touchpad;
 
-        CastFrame(int status, int revision, Bitmap bitmap) {
+        CastFrame(int status, int revision, Bitmap bitmap, boolean touchpad) {
             this.status = status;
             this.revision = revision;
             this.bitmap = bitmap;
+            this.touchpad = touchpad;
         }
     }
 

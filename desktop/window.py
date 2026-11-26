@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 )
 
 from desktop.cast import CastRegion, RegionCapture
+from desktop.pdf_editor import PdfEditor
 from desktop.receiver import CAST_ERROR, CAST_PAUSED, CAST_READY, CLIPBOARD_TIMEOUT
 
 
@@ -28,12 +29,15 @@ class Surface(QWidget):
                 flags = Qt.AlignmentFlag.AlignCenter.value | Qt.TextFlag.TextWordWrap.value
                 painter.drawText(self.rect().adjusted(24, 0, -24, 0), flags, self.message)
                 return
-            size = self.image.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
-            target = self.rect()
-            target.setSize(size)
-            target.moveCenter(self.rect().center())
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-            painter.drawImage(target, self.image)
+            painter.drawImage(self.image_rect(), self.image)
+
+    def image_rect(self):
+        size = self.image.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        target = self.rect()
+        target.setSize(size)
+        target.moveCenter(self.rect().center())
+        return target
 
 
 class MirrorWindow(QMainWindow):
@@ -74,6 +78,9 @@ class MirrorWindow(QMainWindow):
         bar_layout.addStretch()
         self.status = QLabel(objectName="status")
         bar_layout.addWidget(self.status)
+        self.pdf_button = QPushButton("Open PDF")
+        self.pdf_button.clicked.connect(lambda: self.pdf.open_picker())
+        bar_layout.addWidget(self.pdf_button)
         self.region_button = QPushButton("Select region")
         self.region_button.clicked.connect(self.select_region)
         bar_layout.addWidget(self.region_button)
@@ -91,10 +98,12 @@ class MirrorWindow(QMainWindow):
         self.stack = QStackedWidget()
         layout.addWidget(self.stack, 1)
         self.stack.addWidget(self.pairing_page())
-        self.annotation = DesktopAnnotations(view)
-        self.capture = RegionCapture(view)
         self.surface = Surface()
         self.stack.addWidget(self.surface)
+        self.pdf = PdfEditor(view, Surface(), self.refresh, lambda: self.annotation.refresh())
+        self.stack.addWidget(self.pdf)
+        self.annotation = DesktopAnnotations(view, self.pdf.apply_events)
+        self.capture = RegionCapture(view)
         self.tray = QSystemTrayIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon), self)
         self.tray.setToolTip("S-Pen Mirror is casting")
         self.tray_menu = QMenu(self)
@@ -225,6 +234,7 @@ class MirrorWindow(QMainWindow):
             return
         self.version, mode, image = update
         region = self.view.current_region()
+        pdf_visible = self.pdf.file is not None and mode in ("ink", "write", "cast")
         cast_status, _, _ = self.view.capture_update()
         self.surface.image = image
         self.surface.message = {
@@ -238,7 +248,8 @@ class MirrorWindow(QMainWindow):
         }.get(mode, "Waiting for the phone’s picture…")
         self.surface.update()
         self.annotation.set_enabled(mode == "write" or (mode == "cast" and region is not None))
-        self.region_button.setVisible(mode == "cast")
+        self.pdf_button.setVisible(mode in ("ink", "write", "cast"))
+        self.region_button.setVisible(mode == "cast" and not pdf_visible)
         self.region_button.setText("Change region" if region else "Select region")
         self.stop_button.setVisible(mode == "cast" and region is not None)
         if mode == "cast" and region is None:
@@ -255,22 +266,33 @@ class MirrorWindow(QMainWindow):
                     self.selector.kill()
                 elif self.hidden_for_cast:
                     self.show_controls()
-            self.stack.setCurrentIndex(0 if mode == "pair" else 1)
             self.status.setText({"pair": "Waiting for phone", "ink": "Live ink",
                                  "screen": "Screen mirror", "write": "Writing on desktop",
                                  "cast": "Write on PC"}[mode])
-            self.save_button.setVisible(mode == "ink")
-            self.full_button.setVisible(mode in ("ink", "screen"))
-            if mode in ("pair", "cast"):
+            if mode == "pair" or (mode == "cast" and not pdf_visible):
                 self.leave_fullscreen()
+        self.stack.setCurrentWidget(self.pdf if pdf_visible else self.stack.widget(0) if mode == "pair" else self.surface)
+        self.save_button.setVisible(mode == "ink" and not pdf_visible)
+        self.full_button.setVisible(mode in ("ink", "screen") or pdf_visible)
         self.save_button.setEnabled(not image.isNull())
+        if pdf_visible:
+            self.status.setText("PDF · Write on PC" if mode == "cast" else "PDF · tap Write on PC")
+            self.pdf.render()
+        elif self.status.text().startswith("PDF ·"):
+            self.status.setText("Write on PC" if mode == "cast" else "Live ink")
 
     def closeEvent(self, event):
+        if not self.pdf.confirm_close():
+            event.ignore()
+            return
         self.shutdown()
         super().closeEvent(event)
 
     def shutdown(self):
         self.timer.stop()
+        self.annotation.refresh()
+        self.pdf.finish()
+        self.pdf.save_pending()
         self.clear_pairing_clipboard()
         if self.selector is not None:
             selector, self.selector = self.selector, None
@@ -290,7 +312,7 @@ class MirrorWindow(QMainWindow):
     def toggle_fullscreen(self):
         if self.isFullScreen():
             self.leave_fullscreen()
-        elif self.mode in ("ink", "screen"):
+        elif self.mode in ("ink", "screen") or self.stack.currentWidget() is self.pdf:
             self.showFullScreen()
             self.bar.hide()
 

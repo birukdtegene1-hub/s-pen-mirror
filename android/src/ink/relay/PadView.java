@@ -15,6 +15,7 @@ final class PadView extends View {
     private final RelayApp app;
     private final Runnable historyChanged;
     private final CastViewport viewport;
+    private final FingerTouchpad touchpad;
     private final Paint previewPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
     private final Paint cursorPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private Link.CastFrame preview = Link.CastFrame.EMPTY;
@@ -23,7 +24,8 @@ final class PadView extends View {
     private boolean full = true, scheduled;
     private boolean remoteStroke;
     private boolean castStroke, suppressNavigation;
-    private boolean eraserHeld, strokeEraser, segmentOpen, hovering;
+    private boolean panWithFingers;
+    private boolean sideButtonDown, hardwareEraser, strokeEraser, segmentOpen, hovering;
     private float stylusX, stylusY;
     private int penId = -1;
     private int strokeRevision, firstFinger = -1, secondFinger = -1;
@@ -35,6 +37,7 @@ final class PadView extends View {
         app = (RelayApp) ctx.getApplicationContext();
         this.historyChanged = historyChanged;
         this.viewport = viewport;
+        touchpad = new FingerTouchpad(ctx, app.link::offerPointer);
         cursorPaint.setStyle(Paint.Style.STROKE);
         setContentDescription("S-Pen writing area");
         setFocusable(true);
@@ -65,8 +68,11 @@ final class PadView extends View {
 
     @Override protected void onDraw(Canvas canvas) {
         drawContent(canvas);
-        if (hovering && page != null && (eraserHeld || page.tool == InkPage.Tool.ERASER)) {
-            float radius = Ui.dp(getContext(), 10);
+        if (hovering && page != null && erasing()) {
+            float radius = page.eraserSize * 3.5f / 2;
+            if (app.link.casting() && preview.bitmap != null) radius *= viewport.image.width() / preview.bitmap.getWidth();
+            else if (!app.link.writing) radius *= scale;
+            radius = Math.max(Ui.dp(getContext(), 4), radius);
             cursorPaint.setColor(0xff172a20);
             cursorPaint.setStrokeWidth(Ui.dp(getContext(), 3));
             canvas.drawCircle(stylusX, stylusY, radius, cursorPaint);
@@ -96,19 +102,35 @@ final class PadView extends View {
         canvas.restore();
     }
 
-    boolean temporaryEraser() { return eraserHeld; }
+    boolean erasing() { return app.eraserActive || hardwareEraser; }
 
-    void clearStylus() {
-        if (!hovering && !eraserHeld) return;
-        hovering = false;
-        setEraserHeld(false);
+    void selectEraser(boolean enabled) {
+        app.eraserActive = enabled;
+        historyChanged.run();
         postInvalidateOnAnimation();
     }
 
-    private void setEraserHeld(boolean erasing) {
-        if (eraserHeld == erasing) return;
-        eraserHeld = erasing;
-        historyChanged.run();
+    void clearStylus() {
+        sideButtonDown = false;
+        hideStylus();
+    }
+
+    void cancelFingerInput() {
+        touchpad.cancel();
+        resetNavigation();
+    }
+
+    void setPanWithFingers(boolean enabled) {
+        if (panWithFingers != enabled) cancelFingerInput();
+        panWithFingers = enabled;
+    }
+
+    private void hideStylus() {
+        if (!hovering && !hardwareEraser) return;
+        boolean changed = hardwareEraser;
+        hovering = false;
+        hardwareEraser = false;
+        if (changed) historyChanged.run();
         postInvalidateOnAnimation();
     }
 
@@ -121,14 +143,19 @@ final class PadView extends View {
         stylusX = event.getX(pointer);
         stylusY = event.getY(pointer);
         hovering = true;
-        setEraserHeld(event.getToolType(pointer) == MotionEvent.TOOL_TYPE_ERASER || (buttons & STYLUS_BUTTONS) != 0);
-        if (eraserHeld || (page != null && page.tool == InkPage.Tool.ERASER)) postInvalidateOnAnimation();
+        boolean previous = erasing();
+        boolean pressed = (buttons & STYLUS_BUTTONS) != 0;
+        hardwareEraser = event.getToolType(pointer) == MotionEvent.TOOL_TYPE_ERASER;
+        if (pressed && !sideButtonDown) app.eraserActive = !app.eraserActive;
+        sideButtonDown = pressed;
+        if (previous != erasing()) historyChanged.run();
+        if (previous || erasing()) postInvalidateOnAnimation();
     }
 
     @Override public boolean onHoverEvent(MotionEvent event) {
         if (!isStylus(event.getToolType(0))) return super.onHoverEvent(event);
         if (event.getActionMasked() == MotionEvent.ACTION_HOVER_EXIT) {
-            if (penId == -1) clearStylus();
+            if (penId == -1) hideStylus();
         } else trackStylus(event, 0, event.getButtonState());
         return true;
     }
@@ -154,6 +181,7 @@ final class PadView extends View {
 
     void showPreview(Link.CastFrame frame) {
         if (preview == frame) return;
+        if (preview.touchpad != frame.touchpad) cancelFingerInput();
         if (preview.revision != frame.revision || frame.status != Link.CastFrame.READY) {
             if (penId != -1 && remoteStroke) {
                 finishSegment();
@@ -224,13 +252,21 @@ final class PadView extends View {
         int action = event.getActionMasked(), actionIndex = event.getActionIndex();
         boolean casting = app.link.casting();
         if (action == MotionEvent.ACTION_DOWN) suppressNavigation = false;
+        boolean isEdge = action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN
+                || action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP;
+        boolean useTouchpad = casting && preview.touchpad && !panWithFingers;
+        if (useTouchpad && penId == -1 && !suppressNavigation
+                && (!isEdge || event.getToolType(actionIndex) == MotionEvent.TOOL_TYPE_FINGER)) {
+            touchpad.accept(event, app.link.monitorSwipeSupported, app.link.magnifierSupported);
+            return true;
+        }
         if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN) {
             int type = event.getToolType(actionIndex);
             boolean stylus = isStylus(type);
             boolean writing = app.link.writing;
             if (penId != -1) return true;
             if (casting && !stylus) {
-                if (!suppressNavigation) navigate(event);
+                if (!useTouchpad && !suppressNavigation) navigate(event);
                 return true;
             }
             if (writing ? !stylus : !stylus && !page.fingers) return true;
@@ -244,14 +280,14 @@ final class PadView extends View {
             strokeRevision = preview.revision;
             remoteStroke = writing;
             castStroke = casting;
-            if (!beginSegment(event, actionIndex, stylus && eraserHeld)) {
+            if (!beginSegment(event, actionIndex, erasing())) {
                 remoteStroke = castStroke = false;
                 return true;
             }
             penId = event.getPointerId(actionIndex);
             if (casting) {
                 suppressNavigation = true;
-                resetNavigation();
+                cancelFingerInput();
             }
             getParent().requestDisallowInterceptTouchEvent(true);
         } else if (action == MotionEvent.ACTION_MOVE && penId != -1) {
@@ -259,7 +295,7 @@ final class PadView extends View {
             if (idx != -1) {
                 boolean stylus = isStylus(event.getToolType(idx));
                 if (stylus) trackStylus(event, idx, event.getButtonState());
-                boolean erasing = stylus && eraserHeld;
+                boolean erasing = erasing();
                 if (segmentOpen) {
                     for (int i = 0; i < event.getHistorySize(); i++) add(event, idx, i);
                 }
@@ -281,7 +317,7 @@ final class PadView extends View {
             cancelStroke();
             clearStylus();
         }
-        if (casting && penId == -1 && !suppressNavigation) navigate(event);
+        if (casting && !useTouchpad && penId == -1 && !suppressNavigation) navigate(event);
         update();
         return true;
     }
@@ -313,12 +349,11 @@ final class PadView extends View {
     }
 
     private boolean sendStart(MotionEvent event, int index, boolean erasing) {
-        int tool = erasing || page.tool == InkPage.Tool.CLEAR
-                ? InkPage.Tool.ERASER.ordinal() : page.tool.ordinal();
+        InkPage.Tool selected = erasing ? page.eraserTool() : page.tool;
         byte[] data = ByteBuffer.allocate(30).put((byte) 'S')
                 .putFloat(normalizeX(event.getX(index), castStroke)).putFloat(normalizeY(event.getY(index), castStroke))
-                .putFloat(pressure(event.getPressure(index))).put((byte) tool).putInt(page.color)
-                .putFloat(page.size).putInt(Math.min(10000, getWidth()))
+                .putFloat(pressure(event.getPressure(index))).put((byte) selected.ordinal()).putInt(page.color)
+                .putFloat(erasing ? page.eraserSize : page.size).putInt(Math.min(10000, getWidth()))
                 .putInt(Math.min(10000, getHeight())).array();
         return app.link.offerAnnotation(data, strokeRevision);
     }
@@ -402,6 +437,7 @@ final class PadView extends View {
     }
 
     @Override protected void onDetachedFromWindow() {
+        cancelFingerInput();
         removeCallbacks(pump);
         scheduled = false;
         super.onDetachedFromWindow();

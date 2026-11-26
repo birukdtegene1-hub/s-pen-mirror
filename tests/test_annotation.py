@@ -126,3 +126,28 @@ class AnnotationTests(unittest.TestCase):
         with patch.object(watcher, "_read_context") as read_context:
             watcher._follow_events(stream)
         self.assertEqual(read_context.call_count, 2)
+
+    def test_area_and_stroke_erasers_keep_separate_strokes(self):
+        overlay = self.make_overlay()
+        bounds = (0, 0, 100, 100)
+        brush = dict(action="start", x=.1, y=.3, pressure=1, tool=1,
+                     color=0xffff0000, size=3, page_width=100, page_height=100)
+        for y in (.3, .7):
+            overlay._apply("editor", bounds, dict(brush, y=y))
+            overlay._apply("editor", bounds, dict(action="move", x=.9, y=y, pressure=1))
+            overlay._apply("editor", bounds, {"action": "end"})
+
+        def erase(tool, x):
+            overlay._apply("editor", bounds, dict(brush, tool=tool, size=6, x=x))
+            overlay._apply("editor", bounds, {"action": "end"})
+
+        image = overlay.canvases["editor"].image
+        erase(3, .5)
+        self.assertEqual(image.pixelColor(50, 30).alpha(), 0)
+        self.assertGreater(image.pixelColor(20, 30).alpha(), 0)
+        erase(4, .2)
+        self.assertEqual(image.pixelColor(80, 30).alpha(), 0)
+        self.assertGreater(image.pixelColor(80, 70).alpha(), 0)
+        overlay._apply("editor", bounds, {"action": "undo"})
+        self.assertGreater(image.pixelColor(80, 30).alpha(), 0)
+        self.assertEqual(image.pixelColor(50, 30).alpha(), 0)

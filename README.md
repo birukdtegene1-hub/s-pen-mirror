@@ -20,23 +20,39 @@ The pen turns green when the receiver is ready. Click either button again to sto
 
 - **Ink canvas** starts with S-Pen input and ignores finger touches on the page. Finger touches still operate the toolbar. Use **More → Allow finger drawing** to draw with a finger too.
 - Tap the brush name to select a pressure-sensitive ink pen, fixed-width ballpoint, translucent highlighter, or eraser. **Color** has a palette and hex input. Tap the **px** control for stroke width.
-- Hold the S-Pen side button near or against the phone screen to temporarily use the eraser. A ring marks the eraser position. Releasing the button restores the selected tool, even during a stroke.
+- Tap the S-Pen side button near or against the phone screen to switch to the eraser. Tap again to restore the selected pen. The ring shows the eraser position and changes with its size. Choose **Area eraser** to remove only swept ink or **Stroke eraser** to remove an entire touched stroke. Use Area eraser for marks loaded into the phone’s ink canvas as a bitmap.
 - **Paper** offers plain, ruled, and grid sheets. **Rotate page 90°** rotates the page and its ink. Turn the phone sideways for a wider drawing surface. Page proportions stay consistent on both displays.
 - **Undo**, **Redo**, and **More → Clear canvas** work live. The app saves the last canvas on the phone after you finish writing. Undo history covers the most recent 64 edits in the current app process.
 - On the phone, **More → Full screen** hides the bars and tools. Tap **Exit** or use Android Back to restore them.
 - The PC shows just the page as you write. **Save PNG** exports the current page at its original resolution. **F11** enters full screen and **Esc** returns to the window.
 
-## Writing on the PC
+## Annotating PDFs
+
+1. Pair the phone, then click **Open PDF** in the S-Pen Mirror desktop window and choose the file to edit.
+2. Tap **Write on PC** on the phone. Use the S-Pen to annotate the live page and your fingers to control the PC pointer.
+3. Scroll with two fingers while the PC pointer is over the page to change slides. You can also click **Previous** or **Next** on the PC or use the arrow or page keys. Each page keeps its own ink.
+
+Writable PDFs save automatically after a short pause. **Save PDF** saves immediately. Use **Save a copy** for a signed or read-only PDF, or when a second app has changed the file on disk. Ink is saved as editable PDF annotations. The erasers can edit native ink and imported PDFs may contain marks flattened into the page.
+
+## Writing on the PC screen
 
 1. Pair the phone and tap **Write on PC**.
 2. On the PC, click **Select region** in S-Pen Mirror and drag a rectangle within one display. The selected area appears live on the phone. Press **Esc** to cancel the picker.
 3. Write with the S-Pen directly on the preview. The marks appear as an overlay on the PC and in the phone’s preview. Turn the phone sideways to use the same region in landscape.
-4. Pinch or use **+** and **−** to zoom in and out. Drag with a finger to pan. **Fit** shows the entire region, and **Fill** zooms to fill the phone’s writing area.
-5. Tap **Full screen** beside the zoom controls to give the preview the whole phone screen. You can still write, pinch, and pan. Tap **Exit** or use Android Back to restore the controls.
+4. Use **+** and **−** to zoom. **Fit** shows the entire region, and **Fill** zooms to fill the phone’s writing area. Select **More → Use fingers to zoom and pan** to pinch and drag the preview. The same menu switches back to touchpad mode.
+5. Tap **Full screen** beside the zoom controls to give the preview the whole phone screen. Writing and the selected finger mode stay active. Tap **Exit** or use Android Back to restore the controls.
 
 Use the pen, ballpoint, highlighter, eraser, undo, redo, and clear controls for the desktop overlay. Each active window, workspace, display, and full-screen state has its own canvas. The receiver caches up to 16 recent canvases and keeps up to 64 edits per canvas within a shared memory budget. If focus moves to another display, the preview pauses until you return to the selected display.
 
 Open S-Pen Mirror from the PC’s system tray to **Change region** or **Stop casting**. On desktops without a tray, use the receiver window. Tap **Stop writing** on the phone to end the cast and return to the ink canvas.
+
+### Phone touchpad
+
+- Slide one finger to move the PC cursor. Tap to click, double-tap to double-click, or double-tap and slide on the second touch to drag.
+- Slide two fingers to scroll vertically or horizontally. Tap with two fingers to right-click or three fingers to middle-click.
+- Swipe left or right with three fingers to focus the next display in that direction. On a single display the swipe changes workspaces. The screen preview follows and restores your selected region when you return to its display. A shared PDF stays on the phone.
+- Spread or pinch two fingers to adjust Hyprland's desktop magnifier around the PC cursor. The original zoom setting returns when you stop sharing. For preview-only zoom, use **+** and **−** or **More → Use fingers to zoom and pan**.
+- Touchpad input is available while a PC region or PDF is shared. It uses Hyprland’s Wayland virtual pointer. When the compositor cannot provide it, fingers zoom and pan the preview.
 
 ## Mirroring the phone display
 
@@ -49,7 +65,7 @@ Screen mirroring is view-only video, up to 1280 pixels on the long edge and abou
 - **Wrong address in the PC window.** Run `ip -br -4 addr` and find the address of the Wi-Fi or Ethernet adapter the phone can reach. For example, if that address is `192.168.1.25`, run `./s-pen-mirror --host 192.168.1.25`.
 - **PC unreachable.** Make sure both devices can reach each other on the LAN. Guest Wi-Fi can isolate clients. If the Garuda firewall filters inbound traffic, allow **TCP 47831** from the phone on the local network. Use `--port 47832` to choose another port if the default is occupied.
 - **Wi-Fi dropped.** Your canvas stays on the phone. Tap **Pair PC → Reconnect** while the same PC window is running. If you restarted the receiver, choose **Scan a new code**.
-- **Missing PC dependencies.** Install the receiver and Wayland casting dependencies on Garuda with `sudo pacman -S --needed python pyside6 openssl qrencode grim slurp gtk-layer-shell python-gobject python-cairo`.
+- **Missing PC dependencies.** Install the receiver, Wayland casting, and PDF dependencies on Garuda with `sudo pacman -S --needed python pyside6 openssl qrencode grim slurp gtk-layer-shell python-gobject python-cairo poppler-glib`. PDF annotation requires Poppler GLib 25.06 or newer.
 
 ## Source and build
 

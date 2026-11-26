@@ -31,7 +31,7 @@ import java.util.Locale;
 
 public final class MainActivity extends Activity {
     private static final int SCAN = 10, CAPTURE = 11, NOTIFICATIONS = 12;
-    private static final String[] TOOLS = {"Ink pen", "Ballpoint", "Highlighter", "Eraser"};
+    private static final String[] TOOLS = {"Ink pen", "Ballpoint", "Highlighter", "Area eraser", "Stroke eraser"};
     private static final String[] COLORS = {"Forest ink", "Blue", "Green", "Coral", "Purple", "Gold", "Black", "White"};
     private RelayApp app;
     private Link link;
@@ -40,7 +40,7 @@ public final class MainActivity extends Activity {
     private TextView status, castHint, eraserBadge;
     private Button enterFullScreen, exitFullScreen;
     private Button connect, inkMode, screenMode, writeMode, tool, color, size, undo, redo, paper;
-    private boolean capturePrompt, wasCasting, fullScreen;
+    private boolean capturePrompt, wasCasting, fullScreen, panWithFingers;
     private Runnable releaseFullscreenBack;
     private final CastViewport viewport = new CastViewport();
     private final Runnable linkChanged = this::refreshLink;
@@ -52,6 +52,7 @@ public final class MainActivity extends Activity {
         app.attachMain();
         link = app.link;
         fullScreen = state != null && state.getBoolean("fullScreen") && !link.screen;
+        panWithFingers = state != null && state.getBoolean("panWithFingers");
         getWindow().setStatusBarColor(Ui.SHELL);
         getWindow().setNavigationBarColor(Ui.SHELL);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -93,6 +94,7 @@ public final class MainActivity extends Activity {
         }
         FrameLayout area = new FrameLayout(this);
         pad = new PadView(this, viewport, this::refreshTools);
+        pad.setPanWithFingers(panWithFingers);
         area.addView(pad);
         castHint = Ui.text(this, "", 16, 0xffeef2eb, false);
         castHint.setBackgroundColor(0xcc202725);
@@ -170,6 +172,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onResume() { super.onResume(); refreshLink(); }
     @Override protected void onPause() {
+        pad.cancelFingerInput();
         pad.clearStylus();
         if (pad.page != null) {
             pad.cancelStroke();
@@ -186,6 +189,7 @@ public final class MainActivity extends Activity {
     }
     @Override protected void onSaveInstanceState(Bundle out) {
         out.putBoolean("fullScreen", fullScreen);
+        out.putBoolean("panWithFingers", panWithFingers);
         super.onSaveInstanceState(out);
     }
 
@@ -203,6 +207,7 @@ public final class MainActivity extends Activity {
     private void setFullScreen(boolean enabled) {
         if (enabled == fullScreen) return;
         pad.cancelStroke();
+        pad.cancelFingerInput();
         fullScreen = enabled;
         updatePresentation();
         applySystemBars();
@@ -227,7 +232,7 @@ public final class MainActivity extends Activity {
         modes.setVisibility(fullScreen ? View.GONE : View.VISIBLE);
         dock.setVisibility(fullScreen || link.screen ? View.GONE : View.VISIBLE);
         exitFullScreen.setVisibility(fullScreen ? View.VISIBLE : View.GONE);
-        eraserBadge.setVisibility(fullScreen && pad.temporaryEraser() ? View.VISIBLE : View.GONE);
+        eraserBadge.setVisibility(fullScreen && pad.erasing() ? View.VISIBLE : View.GONE);
     }
 
     private void applySystemBars() {
@@ -269,8 +274,6 @@ public final class MainActivity extends Activity {
         updatePresentation();
         paper.setVisibility(writing ? View.GONE : View.VISIBLE);
         zoomControls.setVisibility(casting ? View.VISIBLE : View.GONE);
-        pad.setContentDescription(casting ? "PC preview. Pinch to zoom, drag to pan, and write with the S-Pen."
-                : "S-Pen writing area");
         refreshPreview();
         if (!screen) pad.syncPage();
         refreshTools();
@@ -280,6 +283,25 @@ public final class MainActivity extends Activity {
         boolean casting = link.casting();
         Link.CastFrame frame = casting ? link.castFrame : Link.CastFrame.EMPTY;
         pad.showPreview(frame);
+        boolean touchpad = frame.touchpad && !panWithFingers;
+        String description = !casting ? "S-Pen writing area" : touchpad
+                ? "PC preview. Use fingers as a touchpad and write with the S-Pen."
+                : "PC preview. Pinch to zoom, drag to pan, and write with the S-Pen.";
+        if (touchpad && link.monitorSwipeSupported) {
+            description += " Swipe left or right with three fingers to switch displays or workspaces.";
+        }
+        if (touchpad && link.magnifierSupported) {
+            description += " Pinch with two fingers to zoom the PC display.";
+        }
+        if (!description.contentEquals(pad.getContentDescription())) pad.setContentDescription(description);
+        String label = frame.touchpad ? "Write on PC · " + (touchpad ? "Touchpad" : "Zoom and pan") : link.status;
+        if (casting && frame.status == Link.CastFrame.READY && !frame.touchpad) {
+            label = link.touchpadSupported ? "Touchpad unavailable · Zoom and pan"
+                    : "Restart the PC receiver for touchpad";
+        } else if (touchpad && !link.magnifierSupported) {
+            label = "Touchpad · Restart PC receiver for pinch zoom";
+        }
+        if (!label.contentEquals(status.getText())) status.setText(label);
         boolean ready = frame.status == Link.CastFrame.READY && frame.bitmap != null;
         castHint.setVisibility(casting && !ready ? View.VISIBLE : View.GONE);
         String hint;
@@ -305,9 +327,11 @@ public final class MainActivity extends Activity {
     private void refreshTools() {
         InkPage p = pad.page;
         if (p == null) return;
-        tool.setText(TOOLS[pad.temporaryEraser() ? InkPage.Tool.ERASER.ordinal() : p.tool.ordinal()] + " ▾");
-        eraserBadge.setVisibility(fullScreen && pad.temporaryEraser() ? View.VISIBLE : View.GONE);
-        size.setText(p.size + " px ▾");
+        boolean erasing = pad.erasing();
+        tool.setText(TOOLS[(erasing ? p.eraserTool() : p.tool).ordinal()] + " ▾");
+        eraserBadge.setText(TOOLS[p.eraserTool().ordinal()]);
+        eraserBadge.setVisibility(fullScreen && erasing ? View.VISIBLE : View.GONE);
+        size.setText(erasing ? "Size " + p.eraserSize + " ▾" : p.size + " px ▾");
         GradientDrawable swatch = Ui.shape(this, p.color, 8);
         int d = Ui.dp(this, 16);
         swatch.setBounds(0, 0, d, d);
@@ -325,8 +349,13 @@ public final class MainActivity extends Activity {
     private void chooseTool() {
         InkPage p = pad.page;
         if (p == null) return;
-        new AlertDialog.Builder(this).setTitle("Pen tool").setSingleChoiceItems(TOOLS, p.tool.ordinal(), (dialog, i) -> {
-            p.tool = InkPage.Tool.values()[i];
+        int selection = (pad.erasing() ? p.eraserTool() : p.tool).ordinal();
+        new AlertDialog.Builder(this).setTitle("Pen tool").setSingleChoiceItems(TOOLS, selection, (dialog, i) -> {
+            pad.cancelStroke();
+            boolean erase = i >= InkPage.Tool.ERASER.ordinal();
+            if (erase) p.strokeEraser = i == InkPage.Tool.STROKE_ERASER.ordinal();
+            else p.tool = InkPage.Tool.values()[i];
+            pad.selectEraser(erase);
             p.saveSettings();
             refreshTools();
             dialog.dismiss();
@@ -376,21 +405,27 @@ public final class MainActivity extends Activity {
         LinearLayout body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
         Ui.pad(body, 24, 14);
-        TextView label = Ui.text(this, p.size + " px", 20, Ui.INK, true);
+        boolean erasing = pad.erasing();
+        int initial = erasing ? p.eraserSize : p.size;
+        String units = erasing ? "" : " px";
+        TextView label = Ui.text(this, initial + units, 20, Ui.INK, true);
         body.addView(label);
         SeekBar slider = new SeekBar(this);
         slider.setMax(35);
-        slider.setProgress(p.size - 1);
-        slider.setContentDescription("Stroke width");
+        slider.setProgress(initial - 1);
+        slider.setContentDescription(erasing ? "Eraser size" : "Stroke width");
         slider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             public void onProgressChanged(SeekBar bar, int value, boolean user) {
-                p.size = value + 1; label.setText(p.size + " px"); refreshTools();
+                if (erasing) p.eraserSize = value + 1;
+                else p.size = value + 1;
+                label.setText((value + 1) + units);
+                refreshTools();
             }
             public void onStartTrackingTouch(SeekBar bar) { }
             public void onStopTrackingTouch(SeekBar bar) { p.saveSettings(); }
         });
         body.addView(slider, new LinearLayout.LayoutParams(-1, Ui.dp(this, 52)));
-        new AlertDialog.Builder(this).setTitle("Stroke width").setView(body).setPositiveButton("Done", null)
+        new AlertDialog.Builder(this).setTitle(erasing ? "Eraser size" : "Stroke width").setView(body).setPositiveButton("Done", null)
                 .setOnDismissListener(d -> p.saveSettings()).show();
     }
 
@@ -415,10 +450,18 @@ public final class MainActivity extends Activity {
         InkPage p = pad.page;
         if (p == null) return;
         if (link.writing) {
+            String[] actions = link.castFrame.touchpad
+                    ? new String[]{"Clear annotations", "Full screen", panWithFingers ? "Use fingers as touchpad" : "Use fingers to zoom and pan"}
+                    : new String[]{"Clear annotations", "Full screen"};
             new AlertDialog.Builder(this).setTitle("PC screen")
-                    .setItems(new String[]{"Clear annotations", "Full screen"}, (d, i) -> {
+                    .setItems(actions, (d, i) -> {
                         if (i == 0) pad.editDesktop((byte) 'C');
-                        else setFullScreen(true);
+                        else if (i == 1) setFullScreen(true);
+                        else {
+                            panWithFingers = !panWithFingers;
+                            pad.setPanWithFingers(panWithFingers);
+                            refreshPreview();
+                        }
                     }).show();
             return;
         }

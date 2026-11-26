@@ -5,6 +5,7 @@ import android.app.Application;
 public final class RelayApp extends Application {
     final Link link = new Link();
     InkPage page;
+    boolean eraserActive;
     private int mainActivities;
     private boolean mirrorBusy;
 

@@ -5,7 +5,7 @@ import ssl
 import struct
 import threading
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["QT_QPA_PLATFORMTHEME"] = "offscreen"
@@ -15,8 +15,8 @@ from PySide6.QtGui import QColor, QImage
 
 from desktop.cast import CastRegion
 from desktop.receiver import (
-    CANCEL_PROTOCOL, CAST_ERROR, CAST_PAUSED, CAST_PROTOCOL, CAST_READY, CAST_SELECT, MAX_FRAME,
-    LiveView, Receiver, decode_annotation, read_exact, receive_paired, receive_session, tls_identity,
+    CANCEL_PROTOCOL, CAST_ERROR, CAST_PAUSED, CAST_PROTOCOL, CAST_READY, CAST_SELECT, CAST_WAIT, MAX_FRAME,
+    LiveView, Receiver, decode_annotation, read_exact, receive_frames, receive_paired, receive_session, tls_identity,
 )
 
 
@@ -124,6 +124,94 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(self.view.capture_update()[0], CAST_SELECT)
         with self.assertRaises(ValueError):
             receive_session(Stream(requests), self.token, self.active, self.view)
+
+    def test_touchpad_has_its_own_cast_capability_and_packets(self):
+        self.view.set_pdf_page(((1, 0), (0, 0, 600, 400), ""))
+        pointer = Mock()
+        pointer.update.return_value = True
+        stream = Stream(frame(b"V") + frame(b"F") + frame(b"T", b"C\x01") + frame(b"B"))
+        with self.assertRaises(EOFError):
+            receive_frames(stream, self.view, cast_supported=True, pointer=pointer)
+        reply, status, _revision, jpeg_size, flags = struct.unpack("!cBIIB", stream.reply[1:-2])
+        self.assertEqual((reply, status, jpeg_size, flags), (b"+", CAST_WAIT, 0, 1))
+        self.assertEqual(stream.reply[-2:], b"++")
+        pointer.update.assert_called_once_with(True)
+        pointer.handle.assert_called_once_with((b"C", 0x110, 0), True)
+        self.assertEqual(pointer.close.call_count, 2)
+
+        with self.assertRaisesRegex(ValueError, "Unexpected frame"):
+            receive_frames(Stream(frame(b"V") + frame(b"T", b"C\x01")), self.view, cast_supported=True)
+        with self.assertRaisesRegex(ValueError, "Unexpected frame"):
+            receive_frames(Stream(frame(b"T", b"C\x01")), self.view, cast_supported=True, pointer=pointer)
+
+    def test_monitor_swipe_requires_negotiation_and_leaves_a_shared_pdf_in_place(self):
+        pdf = ((1, 0), (0, 0, 600, 400), "")
+        self.view.set_pdf_page(pdf)
+        swipe = frame(b"V") + frame(b"T", b"N\x00")
+        pointer = Mock()
+        pointer.update.return_value = True
+        with patch("desktop.receiver.focus_adjacent_monitor") as focus:
+            with self.assertRaisesRegex(ValueError, "requires the negotiated protocol"):
+                receive_frames(Stream(swipe), self.view, cast_supported=True, pointer=pointer)
+            focus.assert_not_called()
+            stream = Stream(swipe)
+            with self.assertRaises(EOFError):
+                receive_frames(stream, self.view, cast_supported=True, pointer=pointer, monitor_supported=True)
+            self.assertEqual(stream.reply, b"++")
+            focus.assert_called_once_with(None, -1)
+            self.assertEqual(self.view.pdf_target()[1], pdf)
+            pointer.handle.assert_not_called()
+
+    def test_monitor_swipe_casts_the_destination_and_restores_the_crop_on_return(self):
+        left = dict(name="DP-1", width=1920, height=1080, x=-1920, y=0, scale=1)
+        right = dict(name="eDP-1", width=1200, height=1800, x=0, y=120, scale=1.25, transform=1)
+        crop = CastRegion.from_selection("-1800,100 600x480", [left])
+        full = CastRegion.from_monitor(right)
+        self.view.show("cast")
+        self.view.set_desktop_context("left window", crop.bounds, crop.monitor)
+        self.view.set_region(crop)
+        previous, _ = self.view.capture_target()
+        with patch("desktop.receiver.focus_adjacent_monitor", side_effect=[right, left]) as focus:
+            self.view.switch_monitor(1)
+            self.assertEqual(self.view.current_region(), full)
+            self.assertFalse(self.view.publish_capture(previous, b"late frame"))
+            self.view.set_desktop_context("right window", full.bounds, full.monitor)
+            self.assertEqual(self.view.capture_target()[1], full)
+            self.view.switch_monitor(-1)
+            self.assertEqual(focus.call_args_list, [call("DP-1", 1), call("eDP-1", -1)])
+        self.assertEqual(self.view.current_region(), crop)
+
+    def test_magnifier_packets_are_negotiated_and_cast_ink_maps_back_to_the_desktop(self):
+        self.view.set_pdf_page(((1, 0), (0, 0, 600, 400), ""))
+        pointer = Mock()
+        pointer.handle.return_value = 2
+        pinch = frame(b"V") + frame(b"T", b"Z\x03")
+        with self.assertRaisesRegex(ValueError, "requires the negotiated protocol"):
+            receive_frames(Stream(pinch), self.view, cast_supported=True, pointer=pointer, monitor_supported=True)
+        stream = Stream(pinch)
+        with self.assertRaises(EOFError):
+            receive_frames(stream, self.view, cast_supported=True, pointer=pointer,
+                           monitor_supported=True, magnifier_supported=True)
+        self.assertEqual(stream.reply, b"++")
+        pointer.handle.assert_called_once_with((b"Z", 3, 0), True)
+
+        self.view.set_pdf_page(None)
+        self.view.set_cast_zoom(1)
+        region = CastRegion(200, 100, 400, 250, "DP-1", (-100, -50, 1920, 1080), 1)
+        self.view.set_desktop_context("editor", region.bounds, region.monitor)
+        self.view.set_region(region)
+        old_revision, _ = self.view.capture_target()
+        self.view.set_cast_zoom(2)
+        revision, _ = self.view.capture_target()
+        self.assertNotEqual(old_revision, revision)
+        self.assertFalse(self.view.publish_capture(old_revision, b"old screenshot"))
+        self.assertEqual(self.view.zoom_at(revision), 2)
+        self.view.publish_capture(revision, b"zoomed screenshot", (2, 700, 450))
+        self.view.add_annotation(dict(action="start", x=1, y=0, tool=0), revision)
+        point = self.view.take_annotation_update()[2][0][3]
+        self.assertAlmostEqual(point["x"] * 1919, 699.5)
+        self.assertAlmostEqual(point["y"] * 1079, 300)
+        self.assertEqual(point["clip"], (500 / 1920, 300 / 1080, 200 / 1920, 125 / 1080))
 
     def test_cast_ink_uses_selected_region_and_rejects_stale_input(self):
         monitor = {"name": "DP-1", "x": -1440, "y": 30, "width": 1200,

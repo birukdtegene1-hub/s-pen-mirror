@@ -19,14 +19,16 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /** The same paper and ink compositor supplies the phone view and the transmitted patches. */
 final class InkPage {
-    enum Tool { PEN, BALLPOINT, HIGHLIGHTER, ERASER, CLEAR }
+    enum Tool { PEN, BALLPOINT, HIGHLIGHTER, ERASER, STROKE_ERASER, CLEAR }
     static final String[] PAPERS = {"Plain", "Ruled", "Grid"};
     static final int[] COLORS = {0xff24372e, 0xff195db7, 0xff1a7957, 0xffc95845,
             0xff9447a3, 0xfff5c02f, 0xff171b1a, 0xffffffff};
@@ -35,9 +37,10 @@ final class InkPage {
     Bitmap ink;
     private Canvas inkCanvas;
     final ArrayDeque<Stroke> undo = new ArrayDeque<>(), redo = new ArrayDeque<>();
+    private final ArrayDeque<Stroke> folded = new ArrayDeque<>();
     Tool tool;
-    int color, size, paper;
-    boolean fingers;
+    int color, size, eraserSize, paper;
+    boolean fingers, strokeEraser;
     private Bitmap base, highlight;
     private Canvas mask;
     private Stroke current;
@@ -52,17 +55,19 @@ final class InkPage {
     private final ExecutorService writer = Executors.newSingleThreadExecutor();
     private boolean unsaved, saving;
     private final Runnable store = this::save;
-    private static final int HISTORY = 64;
+    private static final int HISTORY = 64, RETAINED_STROKES = 512;
 
     InkPage(Context context, int viewWidth, int viewHeight) {
         settings = context.getSharedPreferences("ink-tools", Context.MODE_PRIVATE);
         Map<String, ?> saved = settings.getAll();
         tool = Tool.PEN;
         for (Tool option : Tool.values()) {
-            if (option != Tool.CLEAR && option.name().equals(saved.get("tool"))) tool = option;
+            if (option.ordinal() < Tool.ERASER.ordinal() && option.name().equals(saved.get("tool"))) tool = option;
         }
         color = intPreference(saved.get("color"), COLORS[0], Integer.MIN_VALUE, Integer.MAX_VALUE);
         size = intPreference(saved.get("size"), 6, 1, 36);
+        eraserSize = intPreference(saved.get("eraserSize"), 10, 1, 36);
+        strokeEraser = Boolean.TRUE.equals(saved.get("strokeEraser"));
         paper = intPreference(saved.get("paper"), 0, 0, PAPERS.length - 1);
         fingers = Boolean.TRUE.equals(saved.get("fingers"));
         file = new AtomicFile(new File(context.getFilesDir(), "last-ink.png"));
@@ -99,8 +104,11 @@ final class InkPage {
 
     void saveSettings() {
         settings.edit().putString("tool", tool.name()).putInt("color", color).putInt("size", size)
+                .putInt("eraserSize", eraserSize).putBoolean("strokeEraser", strokeEraser)
                 .putInt("paper", paper).putBoolean("fingers", fingers).apply();
     }
+
+    Tool eraserTool() { return strokeEraser ? Tool.STROKE_ERASER : Tool.ERASER; }
 
     void draw(Canvas canvas) {
         canvas.drawColor(0xfffffefa);
@@ -116,7 +124,8 @@ final class InkPage {
     }
 
     void begin(boolean useEraser) {
-        current = new Stroke(useEraser ? Tool.ERASER : tool, color, size);
+        current = new Stroke(useEraser ? eraserTool() : tool, color, useEraser ? eraserSize : size);
+        if (current.tool == Tool.STROKE_ERASER) current.candidates = editableStrokes();
         if (current.tool == Tool.HIGHLIGHTER) {
             clearMask();
             highlightBounds.setEmpty();
@@ -132,8 +141,20 @@ final class InkPage {
         if (i >= 3 && s.data[i - 3] == x && s.data[i - 2] == y
                 && (s.tool != Tool.PEN || s.data[i - 1] == pressure)) return;
         s.add(x, y, pressure);
-        float w = segment(inkCanvas, s, i);
         float lastX = i > 0 ? s.data[i - 3] : x, lastY = i > 0 ? s.data[i - 2] : y;
+        if (s.tool == Tool.STROKE_ERASER) {
+            float endX = x, endY = y;
+            if (s.candidates.removeIf(ink -> {
+                if (!ink.touches(lastX, lastY, endX, endY, s.size * 1.75f)) return false;
+                s.removed.add(ink);
+                return true;
+            })) {
+                replay();
+                dirty.set(0, 0, width, height);
+            }
+            return;
+        }
+        float w = segment(inkCanvas, s, i);
         float r = w / 2 + 2;
         segmentBounds.set((int) Math.floor(Math.min(x, lastX) - r), (int) Math.floor(Math.min(y, lastY) - r),
                 (int) Math.ceil(Math.max(x, lastX) + r), (int) Math.ceil(Math.max(y, lastY) + r));
@@ -173,6 +194,8 @@ final class InkPage {
         }
         Stroke completed = current;
         current = null;
+        completed.candidates = null;
+        if (completed.tool == Tool.STROKE_ERASER && completed.removed.isEmpty()) return;
         remember(completed);
     }
 
@@ -202,6 +225,7 @@ final class InkPage {
         }
         for (Stroke stroke : undo) stroke.rotate(oldHeight);
         for (Stroke stroke : redo) stroke.rotate(oldHeight);
+        for (Stroke stroke : folded) stroke.rotate(oldHeight);
         highlight = null;
         mask = null;
         ink = bitmap(width, height);
@@ -213,10 +237,14 @@ final class InkPage {
     private void remember(Stroke stroke) {
         undo.addLast(stroke);
         redo.clear();
-        if (undo.size() > HISTORY) {
+        if (undo.size() > HISTORY) folded.addLast(undo.removeFirst());
+        while (folded.size() > RETAINED_STROKES) {
+            Stroke oldest = folded.peekFirst();
+            if (undo.stream().anyMatch(edit -> edit.removed.contains(oldest))) break;
             if (base == null) base = bitmap(width, height);
             else if (!base.isMutable()) base = base.copy(Bitmap.Config.ARGB_8888, true);
-            render(new Canvas(base), undo.removeFirst());
+            folded.removeFirst();
+            if (folded.stream().noneMatch(edit -> edit.removed.contains(oldest))) render(new Canvas(base), oldest);
         }
         changed();
     }
@@ -230,6 +258,7 @@ final class InkPage {
     }
 
     private void render(Canvas target, Stroke stroke) {
+        if (stroke.tool == Tool.STROKE_ERASER) return;
         if (stroke.tool == Tool.CLEAR) {
             target.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR);
             return;
@@ -242,7 +271,25 @@ final class InkPage {
     private void replay() {
         ink.eraseColor(Color.TRANSPARENT);
         if (base != null) inkCanvas.drawBitmap(base, 0, 0, null);
-        for (Stroke s : undo) render(inkCanvas, s);
+        HashSet<Stroke> hidden = new HashSet<>();
+        for (Stroke s : folded) hidden.addAll(s.removed);
+        for (Stroke s : undo) hidden.addAll(s.removed);
+        if (current != null) hidden.addAll(current.removed);
+        for (Stroke s : folded) if (!hidden.contains(s)) render(inkCanvas, s);
+        for (Stroke s : undo) if (!hidden.contains(s)) render(inkCanvas, s);
+    }
+
+    private ArrayList<Stroke> editableStrokes() {
+        ArrayList<Stroke> result = new ArrayList<>();
+        for (Stroke s : folded) applyVisibility(result, s);
+        for (Stroke s : undo) applyVisibility(result, s);
+        return result;
+    }
+
+    private static void applyVisibility(ArrayList<Stroke> visible, Stroke operation) {
+        if (operation.tool == Tool.CLEAR) visible.clear();
+        else if (operation.tool == Tool.STROKE_ERASER) visible.removeAll(operation.removed);
+        else if (operation.tool != Tool.ERASER) visible.add(operation);
     }
 
     private void changed() {
@@ -284,6 +331,8 @@ final class InkPage {
         final int color, size;
         float[] data = new float[96];
         int length;
+        final HashSet<Stroke> removed = new HashSet<>();
+        ArrayList<Stroke> candidates;
         Stroke(Tool tool, int color, int size) { this.tool = tool; this.color = color; this.size = size; }
         void add(float x, float y, float p) {
             if (length + 3 > data.length) data = Arrays.copyOf(data, data.length * 2);
@@ -297,6 +346,35 @@ final class InkPage {
                 data[i] = height - 1 - data[i + 1];
                 data[i + 1] = x;
             }
+        }
+
+        boolean touches(float ax, float ay, float bx, float by, float radius) {
+            float extra = tool == Tool.HIGHLIGHTER ? size * 1.5f : size * .5f;
+            float hit = radius + extra;
+            for (int i = 0; i < length; i += 3) {
+                int previous = Math.max(0, i - 3);
+                float cx = data[previous], cy = data[previous + 1], dx = data[i], dy = data[i + 1];
+                if (Math.max(ax, bx) + hit < Math.min(cx, dx) || Math.max(cx, dx) + hit < Math.min(ax, bx)
+                        || Math.max(ay, by) + hit < Math.min(cy, dy) || Math.max(cy, dy) + hit < Math.min(ay, by)) continue;
+                float bound = hit * hit;
+                float cross = (bx - ax) * (dy - cy) - (by - ay) * (dx - cx);
+                if (Math.abs(cross) > .00001f) {
+                    float along = ((cx - ax) * (dy - cy) - (cy - ay) * (dx - cx)) / cross;
+                    float across = ((cx - ax) * (by - ay) - (cy - ay) * (bx - ax)) / cross;
+                    if (along >= 0 && along <= 1 && across >= 0 && across <= 1) return true;
+                }
+                if (distance(ax, ay, cx, cy, dx, dy) <= bound || distance(bx, by, cx, cy, dx, dy) <= bound
+                        || distance(cx, cy, ax, ay, bx, by) <= bound || distance(dx, dy, ax, ay, bx, by) <= bound) return true;
+            }
+            return false;
+        }
+
+        private static float distance(float x, float y, float ax, float ay, float bx, float by) {
+            float dx = bx - ax, dy = by - ay;
+            float length = dx * dx + dy * dy;
+            float t = length == 0 ? 0 : Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / length));
+            float offsetX = x - ax - t * dx, offsetY = y - ay - t * dy;
+            return offsetX * offsetX + offsetY * offsetY;
         }
     }
 }
